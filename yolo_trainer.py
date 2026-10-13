@@ -9,6 +9,7 @@ from PySide6.QtCore import QThread, Signal
 class TrainingWorker(QThread):
     message = Signal(str)
     progress = Signal(str)
+    epoch_progress = Signal(int, int, str)
     finished_ok = Signal(str)
     failed = Signal(str)
 
@@ -28,6 +29,16 @@ class TrainingWorker(QThread):
 
             self.message.emit(f"Loading model: {self.model_name}")
             model = YOLO(self.model_name)
+
+            def report_epoch(trainer):
+                row = {str(k): float(v) for k, v in getattr(trainer, "metrics", {}).items()
+                       if isinstance(v, (int, float))}
+                epoch = trainer.epoch + 1
+                detail = ", ".join(f"{k}={v:.4f}" for k, v in row.items())
+                self.progress.emit(f"{epoch}/{trainer.epochs} | {detail}")
+                self.epoch_progress.emit(epoch, trainer.epochs, detail)
+
+            model.add_callback("on_fit_epoch_end", report_epoch)
 
             self.message.emit(
                 f"Training on {self.device} | epochs={self.epochs} | imgsz={self.imgsz} | batch={self.batch}"

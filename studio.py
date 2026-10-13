@@ -10,13 +10,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
     QComboBox, QInputDialog, QMessageBox, QFileDialog, QSizePolicy,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QFormLayout, QTabWidget
+    QSpinBox, QDoubleSpinBox, QLineEdit, QFormLayout, QTabWidget, QProgressBar
 )
 
 from config import MODEL_PRESETS, YOLO_FAMILIES
 from dataset_manager import DatasetManager, DatasetError
 from hardware import detect_hardware, cuda_install_command
 from yolo_trainer import TrainingWorker, install_cuda_pytorch
+from project_views import TrainingResultsPanel, InferencePanel
 
 STYLESHEET = """
 QLabel#datasetLabel { font-weight: 600; padding: 4px 2px; }
@@ -364,6 +365,10 @@ class DrillAnnotationStudio(QMainWindow):
         top.addWidget(self._button("Refresh", self.refresh_dataset, "Reload the dataset from disk (F5)"))
         root.addLayout(top)
 
+        self.workspace_tabs = QTabWidget()
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_image_panel())
         splitter.addWidget(self._build_canvas_panel())
@@ -372,7 +377,13 @@ class DrillAnnotationStudio(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([280, 1000, 380])
-        root.addWidget(splitter, 1)
+        workspace_layout.addWidget(splitter, 1)
+        self.results_panel = TrainingResultsPanel()
+        self.inference_panel = InferencePanel()
+        self.workspace_tabs.addTab(workspace, "Dataset & Training")
+        self.workspace_tabs.addTab(self.results_panel, "Training Results")
+        self.workspace_tabs.addTab(self.inference_panel, "Detect")
+        root.addWidget(self.workspace_tabs, 1)
 
         self.status = QLabel("Ready")
         self.statusBar().addWidget(self.status, 1)
@@ -540,6 +551,11 @@ class DrillAnnotationStudio(QMainWindow):
 
         self.train_btn = self._button("Train YOLO", self.train, primary=True)
         layout.addWidget(self.train_btn)
+        self.train_progress = QProgressBar()
+        self.train_progress.setRange(0, 100)
+        self.train_progress.setValue(0)
+        self.train_progress.setFormat("Training progress: %p%")
+        layout.addWidget(self.train_progress)
         layout.addStretch(1)
         return tab
 
@@ -590,6 +606,7 @@ class DrillAnnotationStudio(QMainWindow):
     def load_dataset(self, path):
         try:
             self.manager.open(path)
+            self.results_panel.set_dataset_root(self.manager.info.root)
             if not self.manager.classes:
                 ids=self.manager.detect_class_ids()
                 if ids:
@@ -847,24 +864,43 @@ class DrillAnnotationStudio(QMainWindow):
         self.worker=TrainingWorker(model,data_yaml,device,self.epochs.value(),self.imgsz.value(),self.batch.value(),run_root)
         self.train_btn.setEnabled(False)
         self.worker.message.connect(lambda s:self.status.setText(s))
+        self.worker.progress.connect(lambda s:self.status.setText(f"Training: {s}"))
+        self.worker.epoch_progress.connect(self.update_training_progress)
         self.worker.finished_ok.connect(self.training_finished)
         self.worker.failed.connect(self.training_failed)
         self.worker.finished.connect(lambda:self.train_btn.setEnabled(True))
         self.worker.start()
 
     def training_finished(self,path):
+        self.train_progress.setValue(100)
+        self.results_panel.refresh_runs()
         self.status.setText(f"Training finished: {path}")
         QMessageBox.information(self,"Training Complete",f"Training finished.\n\n{path}")
 
     def training_failed(self,msg):
+        self.results_panel.refresh_runs()
         self.status.setText("Training failed.")
         QMessageBox.critical(self,"Training Failed",msg)
+
+    def select_detection_model(self, path):
+        self.workspace_tabs.setCurrentWidget(self.inference_panel)
+        self.inference_panel.model_path.setText(str(path))
+        self.inference_panel.load_model()
+
+    def update_training_progress(self, epoch, total, detail):
+        self.train_progress.setRange(0, max(1, total))
+        self.train_progress.setValue(epoch)
+        self.status.setText(f"Training: epoch {epoch}/{total}" + (f" | {detail}" if detail else ""))
 
     def closeEvent(self,event):
         if self.unsaved:
             ans=QMessageBox.question(self,"Unsaved","Save current annotation before closing?",QMessageBox.Save|QMessageBox.Discard|QMessageBox.Cancel,QMessageBox.Save)
             if ans==QMessageBox.Save and not self.save_annotation(): event.ignore(); return
             if ans==QMessageBox.Cancel: event.ignore(); return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "Training in progress", "Wait for training to finish before closing the studio.")
+            event.ignore(); return
+        self.inference_panel.stop_and_wait()
         event.accept()
 
 def main():

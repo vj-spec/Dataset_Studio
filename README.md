@@ -12,6 +12,8 @@ Compact PySide6 desktop application for:
 - NVIDIA GPU detection
 - optional CUDA-enabled PyTorch installation into the active Python environment
 - YOLO training in a worker thread
+- per-epoch training progress, run metrics history, and checkpoint export
+- model checkpoint inspection and image/video/webcam inference with class filters
 
 ## Safety behavior
 
