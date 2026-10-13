@@ -1,0 +1,3 @@
+tin
+paper
+plastic_bottle
