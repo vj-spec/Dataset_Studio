@@ -339,20 +339,6 @@ class DetectWorker(QThread):
             raise RuntimeError("Video links need yt-dlp. Install project dependencies with: python -m pip install -r requirements.txt") from exc
         self.message.emit("Downloading video for detection…")
         self._temporary_video = tempfile.TemporaryDirectory(prefix="yolo_studio_video_")
-        output_template = str(Path(self._temporary_video.name) / "source.%(ext)s")
-        last_percent = [-5]
-
-        def report_download(info):
-            if info.get("status") != "downloading":
-                return
-            total = info.get("total_bytes") or info.get("total_bytes_estimate")
-            downloaded = info.get("downloaded_bytes", 0)
-            if total:
-                percent = int(downloaded * 100 / total)
-                if percent >= last_percent[0] + 5 or percent >= 100:
-                    last_percent[0] = percent
-                    self.message.emit(f"Downloading source video: {percent}%")
-
         class QuietLogger:
             def debug(self, _message):
                 pass
@@ -366,31 +352,59 @@ class DetectWorker(QThread):
             def error(self, _message):
                 pass
 
-        options = {
-            "quiet": True,
-            "no_warnings": True,
-            "logger": QuietLogger(),
-            "noplaylist": True,
-            "outtmpl": output_template,
-            "progress_hooks": [report_download],
-            # Prefer H.264 MP4 when available; detection does not need audio.
-            "format": "bestvideo[vcodec^=avc1][protocol^=https]/bestvideo[ext=mp4][protocol^=https]/bestvideo[protocol^=https]/bestvideo/best",
-        }
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info and info.get("entries"):
-                info = next((entry for entry in info["entries"] if entry), None)
-            candidates = []
-            if info:
-                candidates.extend(item.get("filepath") for item in info.get("requested_downloads", []) if item.get("filepath"))
-                candidates.extend([info.get("_filename"), ydl.prepare_filename(info)])
-        for candidate in candidates:
-            if candidate and Path(candidate).is_file():
-                return candidate
-        downloaded_files = list(Path(self._temporary_video.name).glob("source.*"))
-        if downloaded_files:
-            return str(downloaded_files[0])
-        raise RuntimeError("The video link was found, but yt-dlp did not produce a video file.")
+        formats = [
+            "bestvideo[vcodec^=avc1][height<=720][protocol^=https]/bestvideo[vcodec^=avc1][protocol^=https]",
+            "bestvideo[ext=mp4][protocol^=https]",
+            "bestvideo[protocol^=https]",
+            "bestvideo/best",
+        ]
+        errors = []
+        for attempt, format_selector in enumerate(formats, start=1):
+            last_percent = [-5]
+
+            def report_download(info):
+                if info.get("status") != "downloading":
+                    return
+                total = info.get("total_bytes") or info.get("total_bytes_estimate")
+                downloaded = info.get("downloaded_bytes", 0)
+                if total:
+                    percent = int(downloaded * 100 / total)
+                    if percent >= last_percent[0] + 5 or percent >= 100:
+                        last_percent[0] = percent
+                        self.message.emit(f"Downloading source video: {percent}%")
+
+            options = {
+                "quiet": True,
+                "no_warnings": True,
+                "logger": QuietLogger(),
+                "noplaylist": True,
+                "retries": 2,
+                "fragment_retries": 2,
+                "outtmpl": str(Path(self._temporary_video.name) / f"source_{attempt}.%(ext)s"),
+                "progress_hooks": [report_download],
+                "format": format_selector,
+            }
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info and info.get("entries"):
+                        info = next((entry for entry in info["entries"] if entry), None)
+                    candidates = []
+                    if info:
+                        candidates.extend(item.get("filepath") for item in info.get("requested_downloads", []) if item.get("filepath"))
+                        candidates.extend([info.get("_filename"), ydl.prepare_filename(info)])
+                for candidate in candidates:
+                    if candidate and Path(candidate).is_file():
+                        return candidate
+                errors.append("yt-dlp did not produce a video file for the selected format")
+            except Exception as exc:
+                errors.append(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)))
+                if attempt < len(formats):
+                    self.message.emit(f"That stream was unavailable; trying another format ({attempt + 1}/{len(formats)})…")
+        last_error = errors[-1] if errors else "no compatible video format was returned"
+        if "403" in last_error:
+            raise RuntimeError("YouTube denied every available stream (HTTP 403). Try again later or use a local video file.")
+        raise RuntimeError(f"Could not download a playable video from this link. Last error: {last_error}")
 
     def process_frame(self, frame):
         result = self.model.predict(
