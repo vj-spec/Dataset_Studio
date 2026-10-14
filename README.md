@@ -15,6 +15,7 @@ Compact PySide6 desktop application for:
 - per-epoch training progress, run metrics history, and checkpoint export
 - model checkpoint inspection and image/video/webcam inference with class filters
 - photo URLs and supported video page links (including YouTube) for detection; annotated photos/videos can be saved
+- URL videos are downloaded to a temporary file before processing so playback controls and seeking work with OpenCV; the temporary source is removed afterward
 
 ## Safety behavior
 

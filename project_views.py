@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import csv
+import re
 import shutil
+import tempfile
+import threading
+import time
 import urllib.request
 from urllib.parse import urlparse
 from pathlib import Path
@@ -14,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QListWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QFileDialog, QLineEdit, QFormLayout, QComboBox, QDoubleSpinBox,
     QGroupBox, QCheckBox, QScrollArea, QTableWidget, QTableWidgetItem,
-    QMessageBox, QAbstractItemView,
+    QMessageBox, QAbstractItemView, QSlider,
 )
 
 
@@ -199,6 +203,7 @@ class ModelLoadWorker(QThread):
 class DetectWorker(QThread):
     frame_ready = Signal(object)
     message = Signal(str)
+    position = Signal(int, int)
     done = Signal()
     failed = Signal(str)
 
@@ -214,9 +219,30 @@ class DetectWorker(QThread):
         self.output_video = output_video
         self._stop_requested = False
         self.writer = None
+        self._temporary_video = None
+        self.playing = threading.Event()
+        self.playing.set()
+        self._control_lock = threading.Lock()
+        self._pending_seek = None
+        self.speed = 1.0
+        self._skip_fraction = 0.0
 
     def stop(self):
         self._stop_requested = True
+        self.playing.set()
+
+    def pause(self):
+        self.playing.clear()
+
+    def play(self):
+        self.playing.set()
+
+    def set_speed(self, speed):
+        self.speed = max(0.25, min(4.0, float(speed)))
+
+    def seek_frame(self, frame):
+        with self._control_lock:
+            self._pending_seek = max(0, int(frame))
 
     def run(self):
         cap = None
@@ -234,28 +260,53 @@ class DetectWorker(QThread):
                 return
             video_source = int(self.source) if self.source_kind == "Camera" else str(self.source)
             if self.source_kind == "Video" and self.source_mode == "URL":
-                self.message.emit("Resolving video link…")
-                video_source = self.resolve_video_url(self.source)
+                video_source = self.download_video(self.source)
             cap = cv2.VideoCapture(video_source)
             if not cap.isOpened():
                 raise RuntimeError(f"Could not open {self.source_kind.lower()}: {self.source}")
-            if self.source_kind == "Video" and self.output_video:
-                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                self.video_fps = fps if fps > 0 else 25.0
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            self.video_fps = fps if fps > 0 else 25.0
+            total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            self.position.emit(0, total_frames)
             self.message.emit(f"Detecting from {self.source_kind.lower()}…")
             while not self._stop_requested:
+                with self._control_lock:
+                    seek_to = self._pending_seek
+                    self._pending_seek = None
+                if not self.playing.is_set() and seek_to is None:
+                    self.playing.wait(0.1)
+                    continue
+                if seek_to is not None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
+                    self.position.emit(seek_to, total_frames)
+                started = time.monotonic()
                 ok, frame = cap.read()
                 if not ok:
                     break
                 self.process_frame(frame)
+                frame_number = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+                self.position.emit(frame_number, total_frames)
+                speed = self.speed
+                self._skip_fraction += max(0.0, speed - 1.0)
+                while self._skip_fraction >= 1.0:
+                    if not cap.grab():
+                        break
+                    self._skip_fraction -= 1.0
+                if fps > 0 and speed < 1.0:
+                    delay = (1.0 / (fps * speed)) - (time.monotonic() - started)
+                    if delay > 0:
+                        time.sleep(delay)
             self.done.emit()
         except Exception as exc:
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            message = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc))
+            self.failed.emit(f"{type(exc).__name__}: {message}")
         finally:
             if cap is not None:
                 cap.release()
             if self.writer is not None:
                 self.writer.release()
+            if self._temporary_video is not None:
+                self._temporary_video.cleanup()
 
     @staticmethod
     def validate_web_url(url):
@@ -280,30 +331,66 @@ class DetectWorker(QThread):
             raise ValueError("The URL did not return a supported image. Use a direct image link.")
         return frame
 
-    @classmethod
-    def resolve_video_url(cls, url):
-        url = cls.validate_web_url(url)
+    def download_video(self, url):
+        url = self.validate_web_url(url)
         try:
             import yt_dlp
         except ImportError as exc:
             raise RuntimeError("Video links need yt-dlp. Install project dependencies with: python -m pip install -r requirements.txt") from exc
+        self.message.emit("Downloading video for detection…")
+        self._temporary_video = tempfile.TemporaryDirectory(prefix="yolo_studio_video_")
+        output_template = str(Path(self._temporary_video.name) / "source.%(ext)s")
+        last_percent = [-5]
+
+        def report_download(info):
+            if info.get("status") != "downloading":
+                return
+            total = info.get("total_bytes") or info.get("total_bytes_estimate")
+            downloaded = info.get("downloaded_bytes", 0)
+            if total:
+                percent = int(downloaded * 100 / total)
+                if percent >= last_percent[0] + 5 or percent >= 100:
+                    last_percent[0] = percent
+                    self.message.emit(f"Downloading source video: {percent}%")
+
+        class QuietLogger:
+            def debug(self, _message):
+                pass
+
+            def info(self, _message):
+                pass
+
+            def warning(self, _message):
+                pass
+
+            def error(self, _message):
+                pass
+
         options = {
             "quiet": True,
             "no_warnings": True,
+            "logger": QuietLogger(),
             "noplaylist": True,
-            "format": "best[protocol^=http][vcodec!=none]/best[protocol^=http]/best",
+            "outtmpl": output_template,
+            "progress_hooks": [report_download],
+            # Prefer H.264 MP4 when available; detection does not need audio.
+            "format": "bestvideo[vcodec^=avc1][protocol^=https]/bestvideo[ext=mp4][protocol^=https]/bestvideo[protocol^=https]/bestvideo/best",
         }
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if info and info.get("entries"):
-            info = next((entry for entry in info["entries"] if entry), None)
-        if not info or not info.get("url"):
-            raise RuntimeError("Could not find a playable video stream at that link.")
-        headers = info.get("http_headers") or {}
-        if headers:
-            header_block = "\r\n".join(f"{key}: {value}" for key, value in headers.items()) + "\r\n"
-            return f"{info['url']}|{header_block}"
-        return info["url"]
+            info = ydl.extract_info(url, download=True)
+            if info and info.get("entries"):
+                info = next((entry for entry in info["entries"] if entry), None)
+            candidates = []
+            if info:
+                candidates.extend(item.get("filepath") for item in info.get("requested_downloads", []) if item.get("filepath"))
+                candidates.extend([info.get("_filename"), ydl.prepare_filename(info)])
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return candidate
+        downloaded_files = list(Path(self._temporary_video.name).glob("source.*"))
+        if downloaded_files:
+            return str(downloaded_files[0])
+        raise RuntimeError("The video link was found, but yt-dlp did not produce a video file.")
 
     def process_frame(self, frame):
         result = self.model.predict(
@@ -423,6 +510,24 @@ class InferencePanel(QWidget):
         self.preview.setMinimumSize(500, 360)
         self.preview.setStyleSheet("background: #111; color: #ddd;")
         dl.addWidget(self.preview, 1)
+        playback = QHBoxLayout()
+        self.playback_button = QPushButton("Pause")
+        self.playback_button.clicked.connect(self.toggle_playback)
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["0.25x", "0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x", "4.0x"])
+        self.speed_combo.setCurrentText("1.0x")
+        self.speed_combo.currentTextChanged.connect(self.change_speed)
+        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider.setRange(0, 0)
+        self.seek_slider.setEnabled(False)
+        self.seek_slider.sliderReleased.connect(self.seek_video)
+        self.position_label = QLabel("00:00 / 00:00")
+        playback.addWidget(self.playback_button)
+        playback.addWidget(QLabel("Speed:"))
+        playback.addWidget(self.speed_combo)
+        playback.addWidget(self.seek_slider, 1)
+        playback.addWidget(self.position_label)
+        dl.addLayout(playback)
         self.status = QLabel("Ready")
         dl.addWidget(self.status)
         split.addWidget(display)
@@ -484,6 +589,8 @@ class InferencePanel(QWidget):
         show_video_output = self.input_type.currentText() == "Video"
         self.video_output.setVisible(show_video_output)
         self.video_output_browse.setVisible(show_video_output)
+        self.playback_button.setEnabled(show_video_output and bool(self.worker and self.worker.isRunning()))
+        self.speed_combo.setEnabled(show_video_output)
 
     def browse_source(self):
         kind = self.input_type.currentText()
@@ -532,16 +639,65 @@ class InferencePanel(QWidget):
         )
         self.worker.frame_ready.connect(self.show_frame)
         self.worker.message.connect(self.status.setText)
+        self.worker.position.connect(self.update_playback_position)
         self.worker.failed.connect(self.detection_failed)
         self.worker.done.connect(self.detection_done)
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(kind != "Image")
+        self.playback_button.setEnabled(kind == "Video")
+        self.speed_combo.setEnabled(kind == "Video")
+        self.seek_slider.setEnabled(False)
+        self.position_label.setText("00:00 / 00:00")
+        self.playback_button.setText("Pause")
+        self.worker.set_speed(float(self.speed_combo.currentText().rstrip("x")))
         self.worker.start()
 
     def stop_detection(self):
         if self.worker:
             self.worker.stop()
             self.stop_button.setEnabled(False)
+
+    def toggle_playback(self):
+        if not self.worker or not self.worker.isRunning():
+            return
+        if self.worker.playing.is_set():
+            self.worker.pause()
+            self.playback_button.setText("Play")
+            self.status.setText("Video paused.")
+        else:
+            self.worker.play()
+            self.playback_button.setText("Pause")
+            self.status.setText("Video playing.")
+
+    def change_speed(self, speed_text):
+        if self.worker:
+            try:
+                self.worker.set_speed(float(speed_text.rstrip("x")))
+            except ValueError:
+                pass
+
+    def seek_video(self):
+        if self.worker and self.worker.isRunning() and self.seek_slider.maximum() > 0:
+            self.worker.seek_frame(self.seek_slider.value())
+
+    def update_playback_position(self, frame, total_frames):
+        if total_frames > 0:
+            self.seek_slider.setRange(0, total_frames - 1)
+            self.seek_slider.setEnabled(bool(self.worker and self.worker.isRunning()))
+            fps = getattr(self.worker, "video_fps", 0.0) if self.worker else 0.0
+            if fps > 0:
+                current_seconds = frame / fps
+                duration_seconds = total_frames / fps
+                self.position_label.setText(
+                    f"{int(current_seconds // 60):02d}:{int(current_seconds % 60):02d} / "
+                    f"{int(duration_seconds // 60):02d}:{int(duration_seconds % 60):02d}"
+                )
+            self.seek_slider.blockSignals(True)
+            self.seek_slider.setValue(min(frame, total_frames - 1))
+            self.seek_slider.blockSignals(False)
+        else:
+            self.seek_slider.setEnabled(False)
+            self.position_label.setText(f"Frame {frame}")
 
     def show_frame(self, frame):
         self.last_frame = frame
@@ -551,12 +707,17 @@ class InferencePanel(QWidget):
         self.preview.setPixmap(QPixmap.fromImage(image).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def detection_failed(self, error):
+        self.run_button.setEnabled(self.model is not None)
+        self.stop_button.setEnabled(False)
+        self.playback_button.setEnabled(False)
         self.status.setText(error)
         QMessageBox.critical(self, "Detection failed", error)
 
     def detection_done(self):
         self.run_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.playback_button.setEnabled(False)
+        self.seek_slider.setEnabled(False)
         self.status.setText("Detection finished.")
 
     def save_image(self):
