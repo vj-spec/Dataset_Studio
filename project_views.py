@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import csv
 import shutil
+import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
@@ -199,11 +202,12 @@ class DetectWorker(QThread):
     done = Signal()
     failed = Signal(str)
 
-    def __init__(self, model, source_kind, source, class_ids, confidence, device, output_video=None):
+    def __init__(self, model, source_kind, source, class_ids, confidence, device, source_mode="File", output_video=None):
         super().__init__()
         self.model = model
         self.source_kind = source_kind
         self.source = source
+        self.source_mode = source_mode
         self.class_ids = class_ids
         self.confidence = confidence
         self.device = device
@@ -218,13 +222,21 @@ class DetectWorker(QThread):
         cap = None
         try:
             if self.source_kind == "Image":
-                frame = cv2.imread(str(self.source))
+                if self.source_mode == "URL":
+                    self.message.emit("Loading photo from URL…")
+                    frame = self.read_remote_image(self.source)
+                else:
+                    frame = cv2.imread(str(self.source))
                 if frame is None:
                     raise RuntimeError(f"Could not read image: {self.source}")
                 self.process_frame(frame)
                 self.done.emit()
                 return
-            cap = cv2.VideoCapture(int(self.source) if self.source_kind == "Camera" else str(self.source))
+            video_source = int(self.source) if self.source_kind == "Camera" else str(self.source)
+            if self.source_kind == "Video" and self.source_mode == "URL":
+                self.message.emit("Resolving video link…")
+                video_source = self.resolve_video_url(self.source)
+            cap = cv2.VideoCapture(video_source)
             if not cap.isOpened():
                 raise RuntimeError(f"Could not open {self.source_kind.lower()}: {self.source}")
             if self.source_kind == "Video" and self.output_video:
@@ -244,6 +256,54 @@ class DetectWorker(QThread):
                 cap.release()
             if self.writer is not None:
                 self.writer.release()
+
+    @staticmethod
+    def validate_web_url(url):
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("Enter a complete http:// or https:// link.")
+        return url.strip()
+
+    @classmethod
+    def read_remote_image(cls, url):
+        url = cls.validate_web_url(url)
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 YOLO-Dataset-Studio"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            length = response.headers.get("Content-Length")
+            if length and int(length) > 50 * 1024 * 1024:
+                raise ValueError("Photo is larger than the 50 MB URL limit.")
+            data = response.read(50 * 1024 * 1024 + 1)
+        if len(data) > 50 * 1024 * 1024:
+            raise ValueError("Photo is larger than the 50 MB URL limit.")
+        frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("The URL did not return a supported image. Use a direct image link.")
+        return frame
+
+    @classmethod
+    def resolve_video_url(cls, url):
+        url = cls.validate_web_url(url)
+        try:
+            import yt_dlp
+        except ImportError as exc:
+            raise RuntimeError("Video links need yt-dlp. Install project dependencies with: python -m pip install -r requirements.txt") from exc
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": "best[protocol^=http][vcodec!=none]/best[protocol^=http]/best",
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info and info.get("entries"):
+            info = next((entry for entry in info["entries"] if entry), None)
+        if not info or not info.get("url"):
+            raise RuntimeError("Could not find a playable video stream at that link.")
+        headers = info.get("http_headers") or {}
+        if headers:
+            header_block = "\r\n".join(f"{key}: {value}" for key, value in headers.items()) + "\r\n"
+            return f"{info['url']}|{header_block}"
+        return info["url"]
 
     def process_frame(self, frame):
         result = self.model.predict(
@@ -301,6 +361,10 @@ class InferencePanel(QWidget):
         self.input_type.addItems(["Image", "Video", "Camera"])
         self.input_type.currentTextChanged.connect(self.update_input_controls)
         inf.addRow("Source type:", self.input_type)
+        self.source_mode = QComboBox()
+        self.source_mode.addItems(["File", "URL"])
+        self.source_mode.currentTextChanged.connect(self.update_input_controls)
+        inf.addRow("Source location:", self.source_mode)
         self.source_row = QWidget()
         sr = QHBoxLayout(self.source_row)
         sr.setContentsMargins(0, 0, 0, 0)
@@ -411,8 +475,11 @@ class InferencePanel(QWidget):
 
     def update_input_controls(self, *_):
         camera = self.input_type.currentText() == "Camera"
+        is_url = self.source_mode.currentText() == "URL"
         self.source_path.setVisible(not camera)
-        self.source_browse.setVisible(not camera)
+        self.source_path.setPlaceholderText("Paste a direct photo/video URL" if is_url else "Select an image or video")
+        self.source_browse.setVisible(not camera and not is_url)
+        self.source_mode.setVisible(not camera)
         self.camera_combo.setVisible(camera)
         show_video_output = self.input_type.currentText() == "Video"
         self.video_output.setVisible(show_video_output)
@@ -427,7 +494,7 @@ class InferencePanel(QWidget):
 
     def browse_video_output(self):
         default = "annotated_video.mp4"
-        if self.source_path.text().strip():
+        if self.source_mode.currentText() == "File" and self.source_path.text().strip():
             source = Path(self.source_path.text().strip())
             default = str(source.with_name(source.stem + "_detected.mp4"))
         path, _ = QFileDialog.getSaveFileName(self, "Save annotated video", default, "MP4 video (*.mp4)")
@@ -447,13 +514,20 @@ class InferencePanel(QWidget):
             QMessageBox.warning(self, "No model", "Load a model checkpoint first.")
             return
         kind = self.input_type.currentText()
+        source_mode = "File" if kind == "Camera" else self.source_mode.currentText()
         source = self.camera_combo.currentIndex() if kind == "Camera" else self.source_path.text().strip()
         if not source and kind != "Camera":
-            QMessageBox.warning(self, "No input", "Choose an image or video first.")
+            QMessageBox.warning(self, "No input", "Choose a file or paste a URL first.")
             return
+        if source_mode == "URL":
+            try:
+                source = DetectWorker.validate_web_url(source)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Invalid URL", str(exc))
+                return
         self.worker = DetectWorker(
             self.model, kind, source, self.selected_classes(),
-            self.confidence.value(), self.device_combo.currentData(),
+            self.confidence.value(), self.device_combo.currentData(), source_mode,
             self.video_output.text().strip() if kind == "Video" and self.video_output.text().strip() else None,
         )
         self.worker.frame_ready.connect(self.show_frame)

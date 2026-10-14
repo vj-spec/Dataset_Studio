@@ -14,6 +14,7 @@ Compact PySide6 desktop application for:
 - YOLO training in a worker thread
 - per-epoch training progress, run metrics history, and checkpoint export
 - model checkpoint inspection and image/video/webcam inference with class filters
+- photo URLs and supported video page links (including YouTube) for detection; annotated photos/videos can be saved
 
 ## Safety behavior
 
