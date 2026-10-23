@@ -30,6 +30,27 @@ class TrainingWorker(QThread):
             self.message.emit(f"Loading model: {self.model_name}")
             model = YOLO(self.model_name)
 
+            def report_batch(trainer):
+                batch = int(getattr(trainer, "batch_i", -1)) + 1
+                batches = int(getattr(trainer, "nb", 0) or 0)
+                if batch == 1 or batch % 5 == 0 or (batches and batch == batches):
+                    epoch = int(getattr(trainer, "epoch", 0)) + 1
+                    text = f"Epoch {epoch}/{self.epochs} — batch {batch}/{batches or '?'}"
+                    losses = getattr(trainer, "tloss", None)
+                    if losses is not None:
+                        try:
+                            values = losses.detach().cpu().tolist()
+                            text += " | loss " + ", ".join(f"{float(v):.4f}" for v in values)
+                        except Exception:
+                            pass
+                    self.progress.emit(text)
+
+            def on_pretrain(trainer):
+                self.message.emit("Preparing dataset and training environment…")
+
+            model.add_callback("on_train_batch_end", report_batch)
+            model.add_callback("on_pretrain_routine_start", on_pretrain)
+
             def report_epoch(trainer):
                 row = {str(k): float(v) for k, v in getattr(trainer, "metrics", {}).items()
                        if isinstance(v, (int, float))}

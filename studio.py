@@ -1,23 +1,78 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+import time
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import Qt, Signal, QRectF
-from PySide6.QtGui import QImage, QPainter, QPen, QColor, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, Signal, QRectF, QProcess, QTimer
+from PySide6.QtGui import QImage, QPainter, QPen, QColor, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
     QComboBox, QInputDialog, QMessageBox, QFileDialog, QSizePolicy,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QFormLayout, QTabWidget, QProgressBar
+    QSpinBox, QDoubleSpinBox, QLineEdit, QFormLayout, QTabWidget, QProgressBar,
+    QDialog, QTextEdit
 )
 
 from config import MODEL_PRESETS, YOLO_FAMILIES
 from dataset_manager import DatasetManager, DatasetError
 from hardware import detect_hardware, cuda_install_command
-from yolo_trainer import TrainingWorker, install_cuda_pytorch
-from project_views import TrainingResultsPanel, InferencePanel
+from yolo_trainer import TrainingWorker
+from project_views import TrainingResultsPanel, InferencePanel, ModelExchangeDialog
+
+
+class PerformanceDialog(QDialog):
+    """Live system resource monitor, similar to a compact Task Manager view."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("System Performance")
+        self.resize(520, 360)
+        self._last_net = None
+        layout = QVBoxLayout(self)
+        self.values = QLabel("Collecting performance data…")
+        self.values.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.values.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
+        layout.addWidget(self.values)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(1000)
+        self.refresh()
+
+    def refresh(self):
+        try:
+            import psutil
+            cpu = psutil.cpu_percent(interval=None)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage(str(Path.cwd()))
+            net = psutil.net_io_counters()
+            down = up = 0.0
+            if self._last_net:
+                then, previous = self._last_net
+                seconds = max(0.001, time.monotonic() - then)
+                down = (net.bytes_recv - previous.bytes_recv) / seconds / 125000
+                up = (net.bytes_sent - previous.bytes_sent) / seconds / 125000
+            self._last_net = (time.monotonic(), net)
+            gpu = "Unavailable (nvidia-smi not found)"
+            try:
+                output = subprocess.check_output(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"], text=True, timeout=2)
+                gpu = "\n".join("  " + line.strip() for line in output.strip().splitlines()) or "No NVIDIA GPU"
+            except Exception:
+                pass
+            self.values.setText(
+                f"CPU       {cpu:5.1f}%\n"
+                f"Memory    {memory.percent:5.1f}%  ({memory.used/1024**3:.1f}/{memory.total/1024**3:.1f} GB)\n"
+                f"Disk      {disk.percent:5.1f}%  ({disk.used/1024**3:.1f}/{disk.total/1024**3:.1f} GB)\n"
+                f"Wi-Fi / network   ↓ {down:.2f} Mbit/s   ↑ {up:.2f} Mbit/s\n"
+                f"GPU\n{gpu}\n\nUpdated every second"
+            )
+        except ImportError:
+            self.values.setText("Performance monitoring needs psutil. Install project dependencies with:\npython -m pip install -r requirements.txt")
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        super().closeEvent(event)
 
 STYLESHEET = """
 QLabel#datasetLabel { font-weight: 600; padding: 4px 2px; }
@@ -362,6 +417,8 @@ class DrillAnnotationStudio(QMainWindow):
         top.addWidget(self.dataset_label, 1)
         top.addWidget(self._button("Open Dataset…", self.open_existing))
         top.addWidget(self._button("New Dataset…", self.create_new))
+        top.addWidget(self._button("Performance", self.show_performance))
+        top.addWidget(self._button("Model Exchange", self.show_model_exchange))
         top.addWidget(self._button("Refresh", self.refresh_dataset, "Reload the dataset from disk (F5)"))
         root.addLayout(top)
 
@@ -833,20 +890,53 @@ class DrillAnnotationStudio(QMainWindow):
             QMessageBox.Yes|QMessageBox.No,QMessageBox.Yes)
         if reply!=QMessageBox.Yes: return
         self.train_btn.setEnabled(False)
-        self.status.setText("Installing CUDA-enabled PyTorch in the current venv...")
-        proc=install_cuda_pytorch()
-        output=[]
-        while True:
-            line=proc.stdout.readline() if proc.stdout else ""
-            if line: output.append(line.rstrip()); self.status.setText(line.rstrip()[-300:])
-            elif proc.poll() is not None: break
-        code=proc.wait()
+        self.cuda_dialog = self._operation_dialog("Installing CUDA-enabled PyTorch")
+        self.cuda_process = QProcess(self)
+        self.cuda_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.cuda_process.readyReadStandardOutput.connect(self._read_cuda_output)
+        self.cuda_process.finished.connect(self._cuda_finished)
+        self.cuda_process.start(sys.executable, ["-m", "pip", "install", "--upgrade", "torch==2.13.0", "torchvision==0.28.0", "--index-url", "https://download.pytorch.org/whl/cu132"])
+        self.cuda_dialog.show()
+
+    def _operation_dialog(self, title):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(650, 380)
+        layout = QVBoxLayout(dialog)
+        progress = QProgressBar()
+        progress.setRange(0, 0)
+        layout.addWidget(progress)
+        log = QTextEdit()
+        log.setReadOnly(True)
+        layout.addWidget(log, 1)
+        dialog.log = log
+        return dialog
+
+    def _read_cuda_output(self):
+        if hasattr(self, "cuda_dialog"):
+            text = bytes(self.cuda_process.readAllStandardOutput()).decode(errors="replace")
+            if text:
+                self.cuda_dialog.log.moveCursor(QTextCursor.End)
+                self.cuda_dialog.log.insertPlainText(text)
+                self.status.setText(text.strip().splitlines()[-1][-250:] if text.strip() else "Installing CUDA PyTorch…")
+
+    def _cuda_finished(self, code, _status):
         self.train_btn.setEnabled(True)
-        if code==0:
-            QMessageBox.information(self,"CUDA Installation Complete","PyTorch CUDA packages were installed.\n\nRestart the application so the new PyTorch runtime is loaded.")
+        if hasattr(self, "cuda_dialog"):
+            self.cuda_dialog.log.append("\nInstallation completed." if code == 0 else f"\nInstallation failed with exit code {code}.")
+        if code == 0:
+            QMessageBox.information(self, "CUDA Installation Complete", "PyTorch CUDA packages were installed. Restart the application so the new PyTorch runtime is loaded.")
         else:
-            QMessageBox.critical(self,"CUDA Installation Failed","\n".join(output[-30:]))
+            QMessageBox.critical(self, "CUDA Installation Failed", "See the live installation log for details.")
         self.detect_hardware_ui()
+
+    def show_performance(self):
+        dialog = PerformanceDialog(self)
+        dialog.exec()
+
+    def show_model_exchange(self):
+        dialog = ModelExchangeDialog(self)
+        dialog.exec()
 
     def train(self):
         if not self.manager.info:
@@ -863,8 +953,10 @@ class DrillAnnotationStudio(QMainWindow):
         run_root=data_yaml.parent/"runs"
         self.worker=TrainingWorker(model,data_yaml,device,self.epochs.value(),self.imgsz.value(),self.batch.value(),run_root)
         self.train_btn.setEnabled(False)
-        self.worker.message.connect(lambda s:self.status.setText(s))
-        self.worker.progress.connect(lambda s:self.status.setText(f"Training: {s}"))
+        self.training_dialog = self._operation_dialog("Training progress")
+        self.training_dialog.show()
+        self.worker.message.connect(self._training_message)
+        self.worker.progress.connect(self._training_progress)
         self.worker.epoch_progress.connect(self.update_training_progress)
         self.worker.finished_ok.connect(self.training_finished)
         self.worker.failed.connect(self.training_failed)
@@ -875,12 +967,26 @@ class DrillAnnotationStudio(QMainWindow):
         self.train_progress.setValue(100)
         self.results_panel.refresh_runs()
         self.status.setText(f"Training finished: {path}")
+        if hasattr(self, "training_dialog"):
+            self.training_dialog.log.append(f"\nTraining finished: {path}")
         QMessageBox.information(self,"Training Complete",f"Training finished.\n\n{path}")
 
     def training_failed(self,msg):
         self.results_panel.refresh_runs()
         self.status.setText("Training failed.")
+        if hasattr(self, "training_dialog"):
+            self.training_dialog.log.append(f"\nTraining failed: {msg}")
         QMessageBox.critical(self,"Training Failed",msg)
+
+    def _training_message(self, message):
+        self.status.setText(message)
+        if hasattr(self, "training_dialog"):
+            self.training_dialog.log.append(message)
+
+    def _training_progress(self, message):
+        self.status.setText(f"Training: {message}")
+        if hasattr(self, "training_dialog"):
+            self.training_dialog.log.append(message)
 
     def select_detection_model(self, path):
         self.workspace_tabs.setCurrentWidget(self.inference_panel)
@@ -891,6 +997,8 @@ class DrillAnnotationStudio(QMainWindow):
         self.train_progress.setRange(0, max(1, total))
         self.train_progress.setValue(epoch)
         self.status.setText(f"Training: epoch {epoch}/{total}" + (f" | {detail}" if detail else ""))
+        if hasattr(self, "training_dialog") and detail:
+            self.training_dialog.log.append(f"Epoch {epoch}/{total} — {detail}")
 
     def closeEvent(self,event):
         if self.unsaved:
