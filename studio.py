@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import subprocess
 import time
+import platform
+import socket
 from pathlib import Path
 
 import cv2
@@ -13,7 +15,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
     QComboBox, QInputDialog, QMessageBox, QFileDialog, QSizePolicy,
     QSpinBox, QDoubleSpinBox, QLineEdit, QFormLayout, QTabWidget, QProgressBar,
-    QDialog, QTextEdit
+    QDialog, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView
 )
 
 from config import MODEL_PRESETS, YOLO_FAMILIES
@@ -23,52 +25,172 @@ from yolo_trainer import TrainingWorker
 from project_views import TrainingResultsPanel, InferencePanel, ModelExchangeDialog
 
 
-class PerformanceDialog(QDialog):
-    """Live system resource monitor, similar to a compact Task Manager view."""
+class TaskManagerPerformanceDialog(QDialog):
+    """Detailed live hardware view with CPU topology, per-core load and device activity."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("System Performance")
-        self.resize(520, 360)
-        self._last_net = None
+        self.resize(900, 650)
+        self._network_previous = {}
+        self._disk_previous = None
+        self._cached_gpu_name = "Reading GPU telemetry…"
+        self.tabs = QTabWidget(self)
         layout = QVBoxLayout(self)
-        self.values = QLabel("Collecting performance data…")
-        self.values.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.values.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
-        layout.addWidget(self.values)
+        layout.addWidget(self.tabs)
+        self.overview = self._new_label_tab("Overview")
+        self.cpu = self._new_label_tab("CPU")
+        self.cores = QTableWidget(0, 3)
+        self.cores.setHorizontalHeaderLabels(["Logical processor", "Usage", "Load"])
+        self.cores.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.cores.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.cores.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tabs.addTab(self.cores, "CPU cores")
+        self.gpu = self._new_label_tab("GPU")
+        self.memory = self._new_label_tab("Memory")
+        self.disks = QTableWidget(0, 5)
+        self.disks.setHorizontalHeaderLabels(["Drive", "File system", "Used", "Free", "Read / write"])
+        self.disks.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.disks.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.disks.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.disks.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.disks.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.tabs.addTab(self.disks, "Disks")
+        self.network = QTableWidget(0, 4)
+        self.network.setHorizontalHeaderLabels(["Adapter", "Receive rate", "Send rate", "Received total"])
+        self.network.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 4):
+            self.network.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.tabs.addTab(self.network, "Network")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1000)
         self.refresh()
 
+    def _new_label_tab(self, title):
+        label = QLabel("Collecting performance data…")
+        label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setStyleSheet("font-family: Consolas, monospace; font-size: 13px; padding: 14px;")
+        label.setWordWrap(True)
+        self.tabs.addTab(label, title)
+        return label
+
+    @staticmethod
+    def _gb(size):
+        return f"{size / (1024 ** 3):.2f} GB"
+
     def refresh(self):
         try:
             import psutil
-            cpu = psutil.cpu_percent(interval=None)
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage(str(Path.cwd()))
-            net = psutil.net_io_counters()
-            down = up = 0.0
-            if self._last_net:
-                then, previous = self._last_net
-                seconds = max(0.001, time.monotonic() - then)
-                down = (net.bytes_recv - previous.bytes_recv) / seconds / 125000
-                up = (net.bytes_sent - previous.bytes_sent) / seconds / 125000
-            self._last_net = (time.monotonic(), net)
-            gpu = "Unavailable (nvidia-smi not found)"
-            try:
-                output = subprocess.check_output(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"], text=True, timeout=2)
-                gpu = "\n".join("  " + line.strip() for line in output.strip().splitlines()) or "No NVIDIA GPU"
-            except Exception:
-                pass
-            self.values.setText(
-                f"CPU       {cpu:5.1f}%\n"
-                f"Memory    {memory.percent:5.1f}%  ({memory.used/1024**3:.1f}/{memory.total/1024**3:.1f} GB)\n"
-                f"Disk      {disk.percent:5.1f}%  ({disk.used/1024**3:.1f}/{disk.total/1024**3:.1f} GB)\n"
-                f"Wi-Fi / network   ↓ {down:.2f} Mbit/s   ↑ {up:.2f} Mbit/s\n"
-                f"GPU\n{gpu}\n\nUpdated every second"
-            )
         except ImportError:
-            self.values.setText("Performance monitoring needs psutil. Install project dependencies with:\npython -m pip install -r requirements.txt")
+            self.overview.setText("Install project requirements to enable detailed hardware monitoring:\npython -m pip install -r requirements.txt")
+            return
+        cpu_pct = psutil.cpu_percent(interval=None)
+        per_cpu = psutil.cpu_percent(interval=None, percpu=True)
+        physical = psutil.cpu_count(logical=False) or 0
+        logical = psutil.cpu_count(logical=True) or len(per_cpu)
+        freq = psutil.cpu_freq()
+        frequency = f"{freq.current:.0f} MHz" if freq else "Unavailable"
+        maximum = f"{freq.max:.0f} MHz" if freq and freq.max else "Unavailable"
+        memory = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        stats = psutil.cpu_stats()
+        uptime = time.strftime("%d days %H:%M:%S", time.gmtime(max(0, time.time() - psutil.boot_time())))
+        gpu_name = self._gpu_name()
+        self.overview.setText(
+            f"Computer: {socket.gethostname()}\nOperating system: {platform.platform()}\nUptime: {uptime}\n\n"
+            f"CPU: {platform.processor() or 'Unknown'}\nPhysical cores: {physical}   Logical processors / threads: {logical}\n"
+            f"CPU speed: {frequency} (maximum {maximum})   Usage: {cpu_pct:.1f}%\n"
+            f"Memory: {self._gb(memory.used)} / {self._gb(memory.total)} ({memory.percent:.1f}%)\n"
+            f"GPU: {gpu_name}\nProcesses: {len(psutil.pids())}   Context switches: {stats.ctx_switches:,}"
+        )
+        cpu_times = psutil.cpu_times()
+        self.cpu.setText(
+            f"{platform.processor() or 'Unknown CPU'}\n\nUsage: {cpu_pct:.1f}%\nPhysical cores: {physical}\n"
+            f"Logical processors / threads: {logical}\nCurrent speed: {frequency}\nMaximum speed: {maximum}\n"
+            f"User time: {getattr(cpu_times, 'user', 0):.1f} s\nSystem time: {getattr(cpu_times, 'system', 0):.1f} s\n"
+            f"Idle time: {getattr(cpu_times, 'idle', 0):.1f} s\nContext switches: {stats.ctx_switches:,}\n"
+            f"Interrupts: {stats.interrupts:,}"
+        )
+        while self.cores.rowCount() < len(per_cpu):
+            row = self.cores.rowCount()
+            self.cores.insertRow(row)
+            self.cores.setItem(row, 0, QTableWidgetItem(f"CPU {row}"))
+            self.cores.setItem(row, 1, QTableWidgetItem())
+            self.cores.setCellWidget(row, 2, QProgressBar())
+        while self.cores.rowCount() > len(per_cpu):
+            self.cores.removeRow(self.cores.rowCount() - 1)
+        for row, value in enumerate(per_cpu):
+            self.cores.item(row, 1).setText(f"{value:.1f}%")
+            self.cores.cellWidget(row, 2).setValue(int(value))
+        self.memory.setText(
+            f"Physical memory\n\nIn use: {self._gb(memory.used)} ({memory.percent:.1f}%)\n"
+            f"Available: {self._gb(memory.available)}\nTotal: {self._gb(memory.total)}\n"
+            f"Cached: {self._gb(getattr(memory, 'cached', 0))}\nBuffers: {self._gb(getattr(memory, 'buffers', 0))}\n\n"
+            f"Virtual memory / page file\nIn use: {self._gb(swap.used)} ({swap.percent:.1f}%)\n"
+            f"Available: {self._gb(swap.free)}\nTotal: {self._gb(swap.total)}"
+        )
+        self._refresh_disks(psutil)
+        self._refresh_network(psutil)
+        self._refresh_gpus()
+
+    def _gpu_name(self):
+        return self._cached_gpu_name
+
+    def _refresh_gpus(self):
+        fields = "name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,clocks.gr,clocks.mem,pstate"
+        labels = ["Name", "GPU utilization", "Memory controller", "VRAM used", "VRAM total", "Temperature", "Power draw", "Power limit", "Fan", "Graphics clock", "Memory clock", "Performance state"]
+        try:
+            result = subprocess.check_output(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"], text=True, timeout=2)
+            lines = []
+            for index, line in enumerate(result.strip().splitlines()):
+                values = [part.strip() for part in line.split(",")]
+                if index == 0 and values:
+                    self._cached_gpu_name = values[0]
+                lines.extend([f"GPU {index} — {labels[col]}: {values[col]}" for col in range(min(len(labels), len(values)))])
+            self.gpu.setText("\n".join(lines) if lines else "No NVIDIA GPU detected.")
+        except Exception:
+            self._cached_gpu_name = "GPU telemetry unavailable"
+            self.gpu.setText("GPU telemetry is unavailable. NVIDIA GPU utilization, VRAM, temperature, power, fan and clock details require nvidia-smi.")
+
+    def _refresh_disks(self, psutil):
+        now = time.monotonic()
+        current_io = psutil.disk_io_counters(perdisk=True) or {}
+        read_rate = write_rate = 0.0
+        if self._disk_previous:
+            then, previous = self._disk_previous
+            elapsed = max(0.001, now - then)
+            read_rate = sum(max(0, item.read_bytes - previous.get(name, item).read_bytes) for name, item in current_io.items()) / elapsed
+            write_rate = sum(max(0, item.write_bytes - previous.get(name, item).write_bytes) for name, item in current_io.items()) / elapsed
+        self._disk_previous = now, current_io
+        drives = []
+        for partition in psutil.disk_partitions(all=False):
+            try:
+                usage = psutil.disk_usage(partition.mountpoint)
+                drives.append((partition, usage))
+            except (OSError, PermissionError):
+                continue
+        self.disks.setRowCount(len(drives) + 1)
+        for row, (partition, usage) in enumerate(drives):
+            values = [partition.device or partition.mountpoint, partition.fstype, f"{self._gb(usage.used)} ({usage.percent:.1f}%)", self._gb(usage.free), ""]
+            for col, value in enumerate(values): self.disks.setItem(row, col, QTableWidgetItem(value))
+        for col, value in enumerate(["All drives", "", "", "", f"Read {read_rate/1024**2:.2f} MB/s | Write {write_rate/1024**2:.2f} MB/s"]):
+            self.disks.setItem(len(drives), col, QTableWidgetItem(value))
+
+    def _refresh_network(self, psutil):
+        counters = psutil.net_io_counters(pernic=True) or {}
+        now = time.monotonic()
+        self.network.setRowCount(len(counters))
+        for row, (name, item) in enumerate(counters.items()):
+            receive = send = 0.0
+            if name in self._network_previous:
+                then, previous = self._network_previous[name]
+                elapsed = max(0.001, now - then)
+                receive = max(0, item.bytes_recv - previous.bytes_recv) / elapsed / 125000
+                send = max(0, item.bytes_sent - previous.bytes_sent) / elapsed / 125000
+            self._network_previous[name] = now, item
+            values = [name, f"↓ {receive:.2f} Mbit/s", f"↑ {send:.2f} Mbit/s", self._gb(item.bytes_recv)]
+            for col, value in enumerate(values): self.network.setItem(row, col, QTableWidgetItem(value))
 
     def closeEvent(self, event):
         self.timer.stop()
@@ -931,7 +1053,7 @@ class DrillAnnotationStudio(QMainWindow):
         self.detect_hardware_ui()
 
     def show_performance(self):
-        dialog = PerformanceDialog(self)
+        dialog = TaskManagerPerformanceDialog(self)
         dialog.exec()
 
     def show_model_exchange(self):
