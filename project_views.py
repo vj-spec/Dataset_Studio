@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QSplitter, QFileDialog, QLineEdit, QFormLayout, QComboBox, QDoubleSpinBox,
     QGroupBox, QCheckBox, QScrollArea, QTableWidget, QTableWidgetItem,
     QMessageBox, QAbstractItemView, QSlider, QSpinBox, QDialog, QDialogButtonBox,
-    QHeaderView, QProgressBar, QTextEdit, QTableWidgetItem,
+    QHeaderView, QProgressBar, QTextEdit,
 )
 
 

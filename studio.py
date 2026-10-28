@@ -23,6 +23,7 @@ from dataset_manager import DatasetManager, DatasetError
 from hardware import detect_hardware, cuda_install_command
 from yolo_trainer import TrainingWorker
 from project_views import TrainingResultsPanel, InferencePanel, ModelExchangeDialog
+from video_annotator import VideoAnnotatorWindow
 
 
 class TaskManagerPerformanceDialog(QDialog):
@@ -510,6 +511,7 @@ class DrillAnnotationStudio(QMainWindow):
         self.current_image = None
         self.unsaved = False
         self.worker = None
+        self.video_annotator_window = None
         self.build_ui()
         self.detect_hardware_ui()
 
@@ -541,6 +543,7 @@ class DrillAnnotationStudio(QMainWindow):
         top.addWidget(self._button("New Dataset…", self.create_new))
         top.addWidget(self._button("Performance", self.show_performance))
         top.addWidget(self._button("Model Exchange", self.show_model_exchange))
+        top.addWidget(self._button("Video Annotator", self.show_video_annotator))
         top.addWidget(self._button("Refresh", self.refresh_dataset, "Reload the dataset from disk (F5)"))
         root.addLayout(top)
 
@@ -1059,6 +1062,15 @@ class DrillAnnotationStudio(QMainWindow):
     def show_model_exchange(self):
         dialog = ModelExchangeDialog(self)
         dialog.exec()
+
+    def show_video_annotator(self):
+        if self.video_annotator_window is None:
+            self.video_annotator_window = VideoAnnotatorWindow(self)
+            self.video_annotator_window.setAttribute(Qt.WA_DeleteOnClose, True)
+            self.video_annotator_window.destroyed.connect(lambda: setattr(self, "video_annotator_window", None))
+        self.video_annotator_window.show()
+        self.video_annotator_window.raise_()
+        self.video_annotator_window.activateWindow()
 
     def train(self):
         if not self.manager.info:

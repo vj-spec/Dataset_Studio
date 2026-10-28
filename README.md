@@ -16,6 +16,7 @@ Compact PySide6 desktop application for:
 - model checkpoint inspection and image/video/webcam inference with class filters
 - photo URLs and supported video page links (including YouTube) for detection; annotated photos/videos can be saved
 - URL videos are downloaded to a temporary file before processing so playback controls and seeking work with OpenCV; the temporary source is removed afterward
+- separate sawing-machine safety video annotation window with temporal object tracks, interpolated keyframes, project save/load, annotated video export, and YOLO dataset export
 
 ## Safety behavior
 
