@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -13,7 +14,7 @@ class TrainingWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, model_name, data_yaml, device, epochs, imgsz, batch, project_dir):
+    def __init__(self, model_name, data_yaml, device, epochs, imgsz, batch, project_dir, resume=False):
         super().__init__()
         self.model_name = model_name
         self.data_yaml = str(data_yaml)
@@ -22,6 +23,15 @@ class TrainingWorker(QThread):
         self.imgsz = int(imgsz)
         self.batch = int(batch)
         self.project_dir = str(project_dir)
+        self.resume = bool(resume)
+        self._stop_requested = threading.Event()
+        self._trainer = None
+
+    def request_stop(self):
+        """Ask Ultralytics to stop at its next safe epoch boundary."""
+        self._stop_requested.set()
+        if self._trainer is not None:
+            self._trainer.stop = True
 
     def run(self):
         try:
@@ -48,8 +58,19 @@ class TrainingWorker(QThread):
             def on_pretrain(trainer):
                 self.message.emit("Preparing dataset and training environment…")
 
+            def on_train_start(trainer):
+                self._trainer = trainer
+                if self._stop_requested.is_set():
+                    trainer.stop = True
+
+            def on_train_epoch_end(trainer):
+                if self._stop_requested.is_set():
+                    trainer.stop = True
+
             model.add_callback("on_train_batch_end", report_batch)
             model.add_callback("on_pretrain_routine_start", on_pretrain)
+            model.add_callback("on_train_start", on_train_start)
+            model.add_callback("on_train_epoch_end", on_train_epoch_end)
 
             def report_epoch(trainer):
                 row = {str(k): float(v) for k, v in getattr(trainer, "metrics", {}).items()
@@ -64,16 +85,20 @@ class TrainingWorker(QThread):
             self.message.emit(
                 f"Training on {self.device} | epochs={self.epochs} | imgsz={self.imgsz} | batch={self.batch}"
             )
-            results = model.train(
-                data=self.data_yaml,
-                epochs=self.epochs,
-                imgsz=self.imgsz,
-                batch=self.batch,
-                device=self.device,
-                project=self.project_dir,
-                name="train",
-                exist_ok=True,
-            )
+            if self.resume:
+                self.message.emit("Resuming training from the last saved checkpoint…")
+                results = model.train(resume=True)
+            else:
+                results = model.train(
+                    data=self.data_yaml,
+                    epochs=self.epochs,
+                    imgsz=self.imgsz,
+                    batch=self.batch,
+                    device=self.device,
+                    project=self.project_dir,
+                    name="train",
+                    exist_ok=True,
+                )
 
             save_dir = getattr(results, "save_dir", None)
             if save_dir:

@@ -14,11 +14,13 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QSlider, QSplitter, QTextEdit, QVBoxLayout, QWidget,
+    QSlider, QSplitter, QTextEdit, QVBoxLayout, QWidget, QInputDialog,
 )
+from app_state import load_state, save_state
+from config import app_state_file
 
 
-CLASSES = [
+LEGACY_CLASSES = [
     "machine_with_guard",
     "machine_without_guard",
     "damaged_wire",
@@ -69,12 +71,13 @@ class ExportWorker(QThread):
     completed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, action, video_path, output_path, tracks, fps, width, height):
+    def __init__(self, action, video_path, output_path, tracks, classes, fps, width, height):
         super().__init__()
         self.action = action
         self.video_path = str(video_path)
         self.output_path = str(output_path)
         self.tracks = copy.deepcopy(tracks)
+        self.classes = list(classes)
         self.fps, self.width, self.height = fps, width, height
 
     def run(self):
@@ -109,7 +112,7 @@ class ExportWorker(QThread):
                 labels.mkdir(parents=True, exist_ok=True)
                 (root / "data.yaml").write_text(
                     "path: .\ntrain: images\nval: images\n\n"
-                    f"nc: {len(CLASSES)}\nnames:\n" + "".join(f"  {i}: {name}\n" for i, name in enumerate(CLASSES)),
+                    f"nc: {len(self.classes)}\nnames:\n" + "".join(f"  {i}: {name}\n" for i, name in enumerate(self.classes)),
                     encoding="utf-8",
                 )
                 frame_index = 0
@@ -254,13 +257,18 @@ class VideoAnnotatorWindow(QMainWindow):
         self.tracks = {}
         self.next_track_id = 1
         self.selected_track_id = None
-        self.current_class = 0
+        self.classes = []
+        self.current_class = -1
         self.pending_box = None
         self.dirty = False
         self.export_worker = None
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.timeout.connect(self._write_autosave)
         self._build_ui()
         self._refresh_tracks()
         self._update_controls()
+        self._restore_autosave()
 
     def _build_ui(self):
         central = QWidget()
@@ -283,12 +291,20 @@ class VideoAnnotatorWindow(QMainWindow):
         side.setMinimumWidth(300)
         side.setMaximumWidth(400)
         sl = QVBoxLayout(side)
-        class_group = QGroupBox("Select object class")
+        class_group = QGroupBox("User-defined classes")
         form = QFormLayout(class_group)
         self.class_combo = QComboBox()
-        self.class_combo.addItems([f"{i}: {name}" for i, name in enumerate(CLASSES)])
+        self.class_combo.setPlaceholderText("Add a class to start")
         self.class_combo.currentIndexChanged.connect(self._class_changed)
         form.addRow("Class:", self.class_combo)
+        class_buttons = QHBoxLayout()
+        add_class = QPushButton("Add class…")
+        add_class.clicked.connect(self.add_class)
+        self.remove_class_button = QPushButton("Remove class")
+        self.remove_class_button.clicked.connect(self.remove_class)
+        class_buttons.addWidget(add_class)
+        class_buttons.addWidget(self.remove_class_button)
+        form.addRow(class_buttons)
         sl.addWidget(class_group)
         sl.addWidget(QLabel("Tracks / object occurrences"))
         self.track_list = QListWidget()
@@ -376,6 +392,7 @@ class VideoAnnotatorWindow(QMainWindow):
         self._show_frame(0)
         self.status.setText(f"Loaded {Path(path).name} — {self.width_px}×{self.height_px} at {self.fps:.2f} FPS")
         self._update_controls()
+        self._schedule_autosave()
         return True
 
     def _show_frame(self, index):
@@ -396,6 +413,7 @@ class VideoAnnotatorWindow(QMainWindow):
         self.time_label.setText(f"{self._time(index)} / {self._time(max(0, self.total_frames - 1))}")
         self._refresh_canvas()
         self._refresh_track_info()
+        self._schedule_autosave()
 
     def show_frame(self, index):
         self._show_frame(index)
@@ -424,6 +442,7 @@ class VideoAnnotatorWindow(QMainWindow):
         self.playing = False
         self.timer.stop()
         self.play_button.setText("Play")
+        self._write_autosave()
 
     def _play_next(self):
         if not self.playing: return
@@ -433,7 +452,53 @@ class VideoAnnotatorWindow(QMainWindow):
         self._show_frame(self.current_frame_idx + 1)
 
     def _class_changed(self, index):
-        if index >= 0: self.current_class = index
+        self.current_class = index if index >= 0 else -1
+        self.remove_class_button.setEnabled(index >= 0)
+        self._schedule_autosave()
+
+    def _refresh_class_combo(self, select=-1):
+        self.class_combo.blockSignals(True)
+        self.class_combo.clear()
+        self.class_combo.addItems(self.classes)
+        self.class_combo.setCurrentIndex(select if 0 <= select < len(self.classes) else -1)
+        self.class_combo.blockSignals(False)
+        self.current_class = self.class_combo.currentIndex()
+        self.remove_class_button.setEnabled(self.current_class >= 0)
+
+    def add_class(self):
+        name, accepted = QInputDialog.getText(self, "Add class", "Class name:")
+        if not accepted:
+            return
+        name = "_".join(name.strip().lower().split())
+        if not name:
+            QMessageBox.warning(self, "Add class", "Enter a class name.")
+            return
+        if name in self.classes:
+            QMessageBox.warning(self, "Add class", "That class already exists.")
+            return
+        self.classes.append(name)
+        self._refresh_class_combo(len(self.classes) - 1)
+        self.dirty = True
+        self._schedule_autosave()
+        self.status.setText(f"Added class: {name}")
+
+    def remove_class(self):
+        index = self.class_combo.currentIndex()
+        if index < 0:
+            return
+        if any(track["class_id"] == index for track in self.tracks.values()):
+            QMessageBox.warning(self, "Class in use", "Change or remove all tracks using this class before removing it.")
+            return
+        self.classes.pop(index)
+        for track in self.tracks.values():
+            if track["class_id"] > index:
+                track["class_id"] -= 1
+                track["class_name"] = self.classes[track["class_id"]]
+        self._refresh_class_combo(min(index, len(self.classes) - 1))
+        self.dirty = True
+        self._schedule_autosave()
+        self._refresh_tracks()
+        self._refresh_canvas()
 
     def _box_drawn(self, box):
         self.pending_box = box
@@ -446,17 +511,21 @@ class VideoAnnotatorWindow(QMainWindow):
                                  self.selected_track_id, self.pending_box)
 
     def _new_track(self, box):
+        if self.current_class < 0 or self.current_class >= len(self.classes):
+            QMessageBox.warning(self, "Add a class first", "Add and select a class before creating tracks.")
+            return
         track_id = self.next_track_id
         self.next_track_id += 1
         self.tracks[track_id] = {"id": track_id, "class_id": self.current_class,
-            "class_name": CLASSES[self.current_class], "start": self.current_frame_idx,
+            "class_name": self.classes[self.current_class], "start": self.current_frame_idx,
             "end": self.total_frames - 1, "keyframes": {str(self.current_frame_idx): dict(box)}}
         self.selected_track_id = track_id
         self.pending_box = None
         self.dirty = True
         self._refresh_tracks()
         self._refresh_canvas()
-        self.status.setText(f"Created track {track_id} for {CLASSES[self.current_class]}.")
+        self.status.setText(f"Created track {track_id} for {self.classes[self.current_class]}.")
+        self._schedule_autosave()
 
     def create_track(self):
         if self.pending_box is None:
@@ -478,6 +547,7 @@ class VideoAnnotatorWindow(QMainWindow):
         self._refresh_tracks()
         self._refresh_canvas()
         self.status.setText(f"Updated track {track['id']} at frame {frame + 1}.")
+        self._schedule_autosave()
 
     def add_keyframe(self):
         track = self.tracks.get(self.selected_track_id)
@@ -489,11 +559,15 @@ class VideoAnnotatorWindow(QMainWindow):
             return
         track["end"] = max(track["end"], self.current_frame_idx)
         track["keyframes"][str(self.current_frame_idx)] = dict(self.pending_box)
+        if 0 <= self.current_class < len(self.classes):
+            track["class_id"] = self.current_class
+            track["class_name"] = self.classes[self.current_class]
         self.pending_box = None
         self.dirty = True
         self._refresh_tracks()
         self._refresh_canvas()
         self.status.setText(f"Added a keyframe to track {track['id']}.")
+        self._schedule_autosave()
 
     def set_track_start(self):
         self._set_track_bound("start")
@@ -522,17 +596,22 @@ class VideoAnnotatorWindow(QMainWindow):
         self.dirty = True
         self._refresh_tracks()
         self._refresh_canvas()
+        self._schedule_autosave()
 
     def change_track_class(self):
         track = self.tracks.get(self.selected_track_id)
         if not track:
             QMessageBox.warning(self, "Track class", "Select a track first.")
             return
+        if self.current_class < 0 or self.current_class >= len(self.classes):
+            QMessageBox.warning(self, "Add a class first", "Add and select a class before changing a track class.")
+            return
         track["class_id"] = self.current_class
-        track["class_name"] = CLASSES[self.current_class]
+        track["class_name"] = self.classes[self.current_class]
         self.dirty = True
         self._refresh_tracks()
         self._refresh_canvas()
+        self._schedule_autosave()
 
     def delete_track(self):
         if self.selected_track_id not in self.tracks: return
@@ -543,6 +622,7 @@ class VideoAnnotatorWindow(QMainWindow):
         self.dirty = True
         self._refresh_tracks()
         self._refresh_canvas()
+        self._schedule_autosave()
 
     def _track_selected(self, row):
         track_id = self.track_list.item(row).data(Qt.UserRole) if row >= 0 and self.track_list.item(row) else None
@@ -552,6 +632,7 @@ class VideoAnnotatorWindow(QMainWindow):
             self.class_combo.setCurrentIndex(self.current_class)
             self._refresh_track_info()
             self._refresh_canvas()
+            self._schedule_autosave()
 
     def _refresh_tracks(self):
         self.track_list.blockSignals(True)
@@ -584,12 +665,70 @@ class VideoAnnotatorWindow(QMainWindow):
         self.timeline.setEnabled(available)
 
     def _confirm_discard(self):
+        if not self.video_path:
+            return True
         if not self.dirty: return True
         choice = QMessageBox.question(self, "Unsaved annotations", "Save annotation project before continuing?",
                                       QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         if choice == QMessageBox.Cancel: return False
         if choice == QMessageBox.Save: return self.save_project()
         return True
+
+    def _schedule_autosave(self):
+        if hasattr(self, "autosave_timer"):
+            self.autosave_timer.start(700)
+
+    def _write_autosave(self):
+        try:
+            save_state("video_annotator.json", {
+                "version": 1,
+                "video_path": self.video_path,
+                "frame": self.current_frame_idx,
+                "fps": self.fps,
+                "classes": self.classes,
+                "tracks": self.tracks,
+                "next_track_id": self.next_track_id,
+                "selected_track_id": self.selected_track_id,
+                "current_class": self.current_class,
+            })
+        except OSError as exc:
+            self.status.setText(f"Could not autosave annotator session: {exc}")
+
+    def _restore_autosave(self):
+        state = load_state("video_annotator.json")
+        path = state.get("video_path")
+        classes = state.get("classes") or []
+        self.classes = [str(name) for name in classes]
+        self._refresh_class_combo(int(state.get("current_class", -1)))
+        if not path:
+            return
+        if not Path(path).is_file():
+            self.status.setText("Previous annotation session found, but its video is unavailable. Use Load Project or Open Video.")
+            return
+        try:
+            tracks = {int(key): value for key, value in state.get("tracks", {}).items()}
+            for track in tracks.values():
+                track["keyframes"] = {str(key): value for key, value in track.get("keyframes", {}).items()}
+                class_id = int(track.get("class_id", -1))
+                if not 0 <= class_id < len(classes):
+                    raise ValueError("Saved track refers to a class that is missing.")
+                track["class_id"] = class_id
+                track["class_name"] = classes[class_id]
+            if not self._open_video_path(path, preserve_tracks=True):
+                return
+            self.classes = [str(name) for name in classes]
+            self._refresh_class_combo(int(state.get("current_class", -1)))
+            self.tracks = tracks
+            self.next_track_id = max(int(state.get("next_track_id", 1)), max(tracks, default=0) + 1)
+            self.selected_track_id = state.get("selected_track_id")
+            if self.selected_track_id is not None:
+                self.selected_track_id = int(self.selected_track_id)
+            self.dirty = bool(tracks or classes)
+            self._refresh_tracks()
+            self._show_frame(int(state.get("frame", 0)))
+            self.status.setText(f"Resumed annotation session: {Path(path).name}")
+        except Exception as exc:
+            self.status.setText(f"Could not restore annotation session: {exc}")
 
     def save_project(self):
         if not self.video_path:
@@ -599,13 +738,16 @@ class VideoAnnotatorWindow(QMainWindow):
         if not path: return False
         payload = {"format": "sawing_safety_video_annotator", "version": 1, "video_path": self.video_path,
                    "fps": self.fps, "total_frames": self.total_frames, "width": self.width_px,
-                   "height": self.height_px, "tracks": self.tracks, "next_track_id": self.next_track_id}
+                   "height": self.height_px, "classes": self.classes, "tracks": self.tracks,
+                   "next_track_id": self.next_track_id, "frame": self.current_frame_idx,
+                   "current_class": self.current_class}
         try:
             Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "Save project failed", str(exc))
             return False
         self.dirty = False
+        self._write_autosave()
         self.status.setText(f"Project saved: {path}")
         return True
 
@@ -620,19 +762,28 @@ class VideoAnnotatorWindow(QMainWindow):
                 video_path, _ = QFileDialog.getOpenFileName(self, "Locate source video", "", "Video files (*.mp4 *.avi *.mov *.mkv *.m4v)")
                 if not video_path: return
             tracks = {int(key): track for key, track in payload.get("tracks", {}).items()}
+            classes = list(payload.get("classes") or [])
+            if not classes and tracks:
+                # Read older projects created with the earlier built-in four-class annotator.
+                classes = list(LEGACY_CLASSES)
             for track in tracks.values():
                 track["keyframes"] = {str(k): v for k, v in track.get("keyframes", {}).items()}
                 if not track["keyframes"]: raise ValueError(f"Track {track.get('id')} has no keyframes.")
                 track["class_id"] = int(track["class_id"])
-                if not 0 <= track["class_id"] < len(CLASSES): raise ValueError("Project contains an unknown class index.")
+                if not 0 <= track["class_id"] < len(classes): raise ValueError("Project contains an unknown class index.")
+                track["class_name"] = classes[track["class_id"]]
             if not self._open_video_path(video_path, preserve_tracks=True): return
+            self.classes = classes
+            self._refresh_class_combo(int(payload.get("current_class", -1)))
             self.tracks = tracks
             self.next_track_id = max(int(payload.get("next_track_id", 1)), max(tracks, default=0) + 1)
             self.selected_track_id = None
             self.dirty = False
             self._refresh_tracks()
             self._refresh_canvas()
+            self._show_frame(int(payload.get("frame", 0)))
             self.status.setText(f"Loaded annotation project: {Path(path).name}")
+            self._write_autosave()
         except Exception as exc:
             QMessageBox.critical(self, "Load project failed", f"{type(exc).__name__}: {exc}")
 
@@ -646,6 +797,9 @@ class VideoAnnotatorWindow(QMainWindow):
         if not self.video_path:
             QMessageBox.warning(self, "No video", "Open a video first.")
             return
+        if action == "yolo" and not self.classes:
+            QMessageBox.warning(self, "Add a class first", "Add at least one class before exporting a YOLO dataset.")
+            return
         if action == "video":
             path, _ = QFileDialog.getSaveFileName(self, "Export annotated video", str(Path(self.video_path).with_name(Path(self.video_path).stem + "_annotated.mp4")), "MP4 video (*.mp4)")
         else:
@@ -653,7 +807,7 @@ class VideoAnnotatorWindow(QMainWindow):
         if not path: return
         self.progress.setValue(0)
         self.progress.show()
-        self.export_worker = ExportWorker(action, self.video_path, path, self.tracks, self.fps, self.width_px, self.height_px)
+        self.export_worker = ExportWorker(action, self.video_path, path, self.tracks, self.classes, self.fps, self.width_px, self.height_px)
         self.export_worker.progress.connect(self._export_progress)
         self.export_worker.completed.connect(self._export_done)
         self.export_worker.failed.connect(self._export_failed)
@@ -686,9 +840,7 @@ class VideoAnnotatorWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
-        if not self._confirm_discard():
-            event.ignore()
-            return
+        self._write_autosave()
         self.stop_playback()
         if self.export_worker and self.export_worker.isRunning():
             self.export_worker.wait()

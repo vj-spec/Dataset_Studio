@@ -18,12 +18,15 @@ from PySide6.QtWidgets import (
     QDialog, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView
 )
 
-from config import MODEL_PRESETS, YOLO_FAMILIES
+from config import MODEL_PRESETS, YOLO_FAMILIES, app_state_file
 from dataset_manager import DatasetManager, DatasetError
 from hardware import detect_hardware, cuda_install_command
 from yolo_trainer import TrainingWorker
 from project_views import TrainingResultsPanel, InferencePanel, ModelExchangeDialog
+from dataset_browser import DatasetBrowserDialog
+from annotation_formats import SUPPORTED_FORMATS
 from video_annotator import VideoAnnotatorWindow
+from app_state import load_state, save_state, clear_saved_state
 
 
 class TaskManagerPerformanceDialog(QDialog):
@@ -512,8 +515,16 @@ class DrillAnnotationStudio(QMainWindow):
         self.unsaved = False
         self.worker = None
         self.video_annotator_window = None
+        self._close_after_training = False
+        self._reset_after_training = False
+        self._restoring_session = False
+        self._cuda_install_pending = False
+        self.session_save_timer = QTimer(self)
+        self.session_save_timer.setSingleShot(True)
+        self.session_save_timer.timeout.connect(self.save_session)
         self.build_ui()
         self.detect_hardware_ui()
+        self.restore_session()
 
     @staticmethod
     def _button(text, slot, tooltip=None, primary=False):
@@ -540,10 +551,14 @@ class DrillAnnotationStudio(QMainWindow):
         self.dataset_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         top.addWidget(self.dataset_label, 1)
         top.addWidget(self._button("Open Dataset…", self.open_existing))
+        top.addWidget(self._button("Open CVAT ZIP…", self.open_cvat_archive))
+        top.addWidget(self._button("Browse Files & Preview…", self.browse_dataset_files))
         top.addWidget(self._button("New Dataset…", self.create_new))
         top.addWidget(self._button("Performance", self.show_performance))
         top.addWidget(self._button("Model Exchange", self.show_model_exchange))
         top.addWidget(self._button("Video Annotator", self.show_video_annotator))
+        self.reset_button = self._button("Reset Everything…", self.reset_everything)
+        top.addWidget(self.reset_button)
         top.addWidget(self._button("Refresh", self.refresh_dataset, "Reload the dataset from disk (F5)"))
         root.addLayout(top)
 
@@ -565,6 +580,8 @@ class DrillAnnotationStudio(QMainWindow):
         self.workspace_tabs.addTab(workspace, "Dataset & Training")
         self.workspace_tabs.addTab(self.results_panel, "Training Results")
         self.workspace_tabs.addTab(self.inference_panel, "Detect")
+        self.workspace_tabs.currentChanged.connect(lambda _index: self.schedule_session_save())
+        self.inference_panel.state_changed.connect(self.schedule_session_save)
         root.addWidget(self.workspace_tabs, 1)
 
         self.status = QLabel("Ready")
@@ -731,11 +748,18 @@ class DrillAnnotationStudio(QMainWindow):
         pf.addRow("Batch:", self.batch)
         layout.addWidget(params)
 
+        train_actions = QHBoxLayout()
         self.train_btn = self._button("Train YOLO", self.train, primary=True)
-        layout.addWidget(self.train_btn)
+        self.resume_btn = self._button("Resume from last.pt", lambda: self.train(resume=True))
+        self.resume_btn.setEnabled(False)
+        self.resume_btn.setToolTip("Continue this dataset’s last saved run from runs/train/weights/last.pt.")
+        train_actions.addWidget(self.train_btn)
+        train_actions.addWidget(self.resume_btn)
+        layout.addLayout(train_actions)
         self.train_progress = QProgressBar()
         self.train_progress.setRange(0, 100)
         self.train_progress.setValue(0)
+        self.train_progress.setFormat("Training progress: %p%")
         self.train_progress.setFormat("Training progress: %p%")
         layout.addWidget(self.train_progress)
         layout.addStretch(1)
@@ -769,6 +793,23 @@ class DrillAnnotationStudio(QMainWindow):
         path=QFileDialog.getExistingDirectory(self,"Open Existing Dataset")
         if path: self.load_dataset(Path(path))
 
+    def open_cvat_archive(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open CVAT export", "", "CVAT export (*.zip)")
+        if not path:
+            return
+        try:
+            extracted = DatasetManager.extract_cvat_archive(Path(path))
+            self.load_dataset(extracted)
+        except Exception as exc:
+            QMessageBox.critical(self, "CVAT import failed", str(exc))
+
+    def browse_dataset_files(self):
+        if not self.manager.info:
+            QMessageBox.information(self, "No dataset open", "Open a dataset first to browse its files.")
+            return
+        dialog = DatasetBrowserDialog(self.manager.info.root, self)
+        dialog.exec()
+
     def create_new(self):
         parent=QFileDialog.getExistingDirectory(self,"Choose Parent Folder")
         if not parent: return
@@ -785,13 +826,15 @@ class DrillAnnotationStudio(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self,"Create Failed",str(exc))
 
-    def load_dataset(self, path):
+    def load_dataset(self, path, quiet=False, restore_classes=None):
         try:
             self.manager.open(path)
             self.results_panel.set_dataset_root(self.manager.info.root)
             if not self.manager.classes:
                 ids=self.manager.detect_class_ids()
-                if ids:
+                if ids and restore_classes and len(restore_classes) > max(ids):
+                    self.manager.prepare_missing_classes(restore_classes)
+                elif ids and not quiet:
                     names=[]
                     for cid in range(max(ids)+1):
                         name,ok=QInputDialog.getText(self,"Class Name",f"Enter name for class ID {cid}:")
@@ -799,15 +842,21 @@ class DrillAnnotationStudio(QMainWindow):
                             raise DatasetError("Class setup cancelled.")
                         names.append(name)
                     self.manager.prepare_missing_classes(names)
-                else:
+                elif not quiet:
                     QMessageBox.information(self,"No Classes Yet","No class names or labeled class IDs were found. Add classes before annotation/training.")
             self.dataset_label.setText(f"{self.manager.info.kind.upper()} | {self.manager.info.root}")
             self.canvas.set_class_names(self.manager.classes)
             self.refresh_class_combo()
             self.refresh_images()
+            self._update_resume_checkpoint(self.manager.info.root)
             self.status.setText(f"Opened {self.manager.info.kind} dataset: {self.manager.info.root}")
+            if not self._restoring_session:
+                self.schedule_session_save()
         except Exception as exc:
-            QMessageBox.critical(self,"Open Failed",str(exc))
+            if quiet:
+                self.status.setText(f"Could not restore dataset: {exc}")
+            else:
+                QMessageBox.critical(self,"Open Failed",str(exc))
 
     def refresh_dataset(self):
         if self.manager.info:
@@ -817,10 +866,10 @@ class DrillAnnotationStudio(QMainWindow):
         self.image_list.clear()
         if not self.manager.info: return
         records=self.manager.image_records()
-        labeled=sum(1 for _,label,_ in records if label and label.is_file())
+        labeled=sum(1 for image,_,_ in records if self.manager.has_annotations(image))
         self.images_header.setText(f"Images  ({labeled}/{len(records)} labeled)")
         for image,label,split in records:
-            mark="✓" if label and label.is_file() else "○"
+            mark="✓" if self.manager.has_annotations(image) else "○"
             item=QListWidgetItem(f"{mark} [{split}] {image.name}")
             item.setData(Qt.UserRole,str(image))
             self.image_list.addItem(item)
@@ -849,25 +898,13 @@ class DrillAnnotationStudio(QMainWindow):
         self.file_label.setText(str(path))
         self.unsaved=False
         self.refresh_box_list()
+        self.schedule_session_save()
 
     def load_labels(self,image_path):
-        label=self.manager.label_path_for(image_path)
-        if not label or not label.is_file(): return []
         image=cv2.imread(str(image_path))
         if image is None: return []
-        h,w=image.shape[:2]; boxes=[]
-        try: lines=label.read_text(encoding="utf-8").splitlines()
-        except OSError: return []
-        for line in lines:
-            p=line.split()
-            if len(p)!=5: continue
-            try: cid=int(p[0]); cx,cy,bw,bh=map(float,p[1:])
-            except ValueError: continue
-            x1=max(0,min(w-1,int((cx-bw/2)*w))); y1=max(0,min(h-1,int((cy-bh/2)*h)))
-            x2=max(0,min(w-1,int((cx+bw/2)*w))); y2=max(0,min(h-1,int((cy+bh/2)*h)))
-            if x2>x1 and y2>y1:
-                boxes.append({"bbox":(x1,y1,x2,y2),"class_id":cid if 0<=cid<len(self.manager.classes) else None})
-        return boxes
+        h,w=image.shape[:2]
+        return self.manager.boxes_for_image(image_path,w,h)
 
     def save_annotation(self):
         if not self.current_image or not self.manager.info: return False
@@ -876,24 +913,43 @@ class DrillAnnotationStudio(QMainWindow):
         for b in self.canvas.boxes:
             if b.get("class_id") is None:
                 QMessageBox.warning(self,"Unassigned Box","Assign a class to every box."); return False
-        label=self.manager.label_path_for(self.current_image)
-        if label is None:
-            QMessageBox.warning(self,"Cannot Save","This image does not map to a writable labels/annotations folder.")
-            return False
-        label.parent.mkdir(parents=True,exist_ok=True)
+        if self.manager.info.annotation_format == "none":
+            if not self.canvas.boxes:
+                self.status.setText("Draw and assign a box before creating annotation files.")
+                return False
+            answer = QMessageBox.question(
+                self, "Create annotation files?",
+                "This dataset has no labels or annotations yet. Create annotation files for this dataset?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if answer != QMessageBox.Yes:
+                return False
+            fmt, accepted = QInputDialog.getItem(
+                self, "Choose annotation format", "Save annotations as:", list(SUPPORTED_FORMATS), 0, False)
+            if not accepted:
+                return False
+            try:
+                self.manager.select_annotation_format(fmt)
+            except Exception as exc:
+                QMessageBox.warning(self, "Annotation format", str(exc))
+                return False
         image=cv2.imread(str(self.current_image))
-        h,w=image.shape[:2]; lines=[]
-        for b in self.canvas.boxes:
-            cid=int(b["class_id"]); x1,y1,x2,y2=b["bbox"]
-            cx=((x1+x2)/2)/w; cy=((y1+y2)/2)/h; bw=(x2-x1)/w; bh=(y2-y1)/h
-            lines.append(f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-        label.write_text("\n".join(lines)+("\n" if lines else ""),encoding="utf-8")
+        if image is None:
+            QMessageBox.warning(self,"Cannot Save",f"Could not read image:\n{self.current_image}")
+            return False
+        h,w=image.shape[:2]
+        try:
+            label = self.manager.save_boxes(self.current_image,w,h,self.canvas.boxes)
+        except Exception as exc:
+            QMessageBox.critical(self,"Save Annotation Failed",str(exc))
+            return False
         self.unsaved=False; self.refresh_images()
         self.status.setText(f"Saved: {label}")
+        self.schedule_session_save()
         return True
 
     def annotation_changed(self):
         self.unsaved=True; self.refresh_box_list()
+        self.schedule_session_save()
 
     def refresh_box_list(self,index=-1):
         self.box_list.blockSignals(True); self.box_list.clear()
@@ -938,7 +994,7 @@ class DrillAnnotationStudio(QMainWindow):
         name,ok=QInputDialog.getText(self,"Add Class","Class name:")
         if not ok or not name.strip(): return
         classes=self.manager.classes+[name]
-        try: self.manager.set_classes(classes); self.refresh_class_combo()
+        try: self.manager.set_classes(classes); self.refresh_class_combo(); self.schedule_session_save()
         except Exception as exc: QMessageBox.warning(self,"Class Error",str(exc))
 
     def delete_class(self):
@@ -961,6 +1017,7 @@ class DrillAnnotationStudio(QMainWindow):
         classes=self.manager.classes[:row]+self.manager.classes[row+1:]
         self.manager.set_classes(classes); self.refresh_class_combo()
         if self.current_image: self.canvas.set_boxes(self.load_labels(self.current_image))
+        self.schedule_session_save()
 
     def previous_image(self):
         r=self.image_list.currentRow()
@@ -1015,6 +1072,8 @@ class DrillAnnotationStudio(QMainWindow):
             QMessageBox.Yes|QMessageBox.No,QMessageBox.Yes)
         if reply!=QMessageBox.Yes: return
         self.train_btn.setEnabled(False)
+        self._cuda_install_pending = True
+        self.save_session()
         self.cuda_dialog = self._operation_dialog("Installing CUDA-enabled PyTorch")
         self.cuda_process = QProcess(self)
         self.cuda_process.setProcessChannelMode(QProcess.MergedChannels)
@@ -1046,6 +1105,8 @@ class DrillAnnotationStudio(QMainWindow):
                 self.status.setText(text.strip().splitlines()[-1][-250:] if text.strip() else "Installing CUDA PyTorch…")
 
     def _cuda_finished(self, code, _status):
+        self._cuda_install_pending = False
+        self.schedule_session_save()
         self.train_btn.setEnabled(True)
         if hasattr(self, "cuda_dialog"):
             self.cuda_dialog.log.append("\nInstallation completed." if code == 0 else f"\nInstallation failed with exit code {code}.")
@@ -1072,7 +1133,7 @@ class DrillAnnotationStudio(QMainWindow):
         self.video_annotator_window.raise_()
         self.video_annotator_window.activateWindow()
 
-    def train(self):
+    def train(self, resume=False):
         if not self.manager.info:
             QMessageBox.warning(self,"No Dataset","Open a dataset first."); return
         data_yaml=self.manager.info.root/"data.yaml"
@@ -1085,8 +1146,17 @@ class DrillAnnotationStudio(QMainWindow):
         device=self.device_combo.currentData() or "auto"
         # Put training runs beside the selected YOLO dataset, not inside the source.
         run_root=data_yaml.parent/"runs"
-        self.worker=TrainingWorker(model,data_yaml,device,self.epochs.value(),self.imgsz.value(),self.batch.value(),run_root)
+        checkpoint = run_root / "train" / "weights" / "last.pt"
+        if resume:
+            if not checkpoint.is_file():
+                QMessageBox.warning(self, "No resume checkpoint", f"No saved checkpoint exists at:\n{checkpoint}")
+                self.resume_btn.setEnabled(False)
+                return
+            model = str(checkpoint)
+        self.worker=TrainingWorker(model,data_yaml,device,self.epochs.value(),self.imgsz.value(),self.batch.value(),run_root,resume=resume)
+        self.save_session()
         self.train_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
         self.training_dialog = self._operation_dialog("Training progress")
         self.training_dialog.show()
         self.worker.message.connect(self._training_message)
@@ -1094,20 +1164,49 @@ class DrillAnnotationStudio(QMainWindow):
         self.worker.epoch_progress.connect(self.update_training_progress)
         self.worker.finished_ok.connect(self.training_finished)
         self.worker.failed.connect(self.training_failed)
-        self.worker.finished.connect(lambda:self.train_btn.setEnabled(True))
+        self.worker.finished.connect(self._training_thread_finished)
         self.worker.start()
 
+    def _update_resume_checkpoint(self, dataset_root):
+        run_dir = Path(dataset_root) / "runs" / "train"
+        checkpoint = run_dir / "weights" / "last.pt"
+        available = checkpoint.is_file()
+        self.resume_btn.setEnabled(available)
+        if available:
+            completed_epochs = 0
+            results_csv = run_dir / "results.csv"
+            if results_csv.is_file():
+                try:
+                    import csv
+                    with results_csv.open("r", encoding="utf-8", newline="") as source:
+                        completed_epochs = sum(1 for _row in csv.DictReader(source))
+                except OSError:
+                    pass
+            self.train_progress.setRange(0, max(1, self.epochs.value()))
+            self.train_progress.setValue(min(completed_epochs, self.epochs.value()))
+            self.train_progress.setFormat(f"Saved checkpoint — epoch {completed_epochs}/{self.epochs.value()} | Resume available")
+        else:
+            self.train_progress.setValue(0)
+            self.train_progress.setFormat("Training progress: %p%")
+
     def training_finished(self,path):
-        self.train_progress.setValue(100)
         self.results_panel.refresh_runs()
-        self.status.setText(f"Training finished: {path}")
+        if self.manager.info:
+            self._update_resume_checkpoint(self.manager.info.root)
+        stopped = bool(self.worker and self.worker._stop_requested.is_set())
+        self.train_progress.setValue(0 if stopped else 100)
+        self.status.setText(f"Training paused and checkpoint saved: {path}" if stopped else f"Training finished: {path}")
         if hasattr(self, "training_dialog"):
-            self.training_dialog.log.append(f"\nTraining finished: {path}")
-        QMessageBox.information(self,"Training Complete",f"Training finished.\n\n{path}")
+            self.training_dialog.log.append(f"\n{'Training paused' if stopped else 'Training finished'}: {path}")
+        if not (stopped and (self._reset_after_training or self._close_after_training)):
+            QMessageBox.information(self,"Training Paused" if stopped else "Training Complete",
+                                    f"{'Training stopped at a safe checkpoint. Resume with the Resume from last.pt button.' if stopped else 'Training finished.'}\n\n{path}")
 
     def training_failed(self,msg):
         self.results_panel.refresh_runs()
         self.status.setText("Training failed.")
+        if self.manager.info:
+            self._update_resume_checkpoint(self.manager.info.root)
         if hasattr(self, "training_dialog"):
             self.training_dialog.log.append(f"\nTraining failed: {msg}")
         QMessageBox.critical(self,"Training Failed",msg)
@@ -1134,14 +1233,195 @@ class DrillAnnotationStudio(QMainWindow):
         if hasattr(self, "training_dialog") and detail:
             self.training_dialog.log.append(f"Epoch {epoch}/{total} — {detail}")
 
+    def _training_thread_finished(self):
+        self.train_btn.setEnabled(True)
+        if self.manager.info:
+            self._update_resume_checkpoint(self.manager.info.root)
+        if self._reset_after_training:
+            self._reset_after_training = False
+            QTimer.singleShot(0, self._perform_reset)
+        elif self._close_after_training:
+            self._close_after_training = False
+            QTimer.singleShot(0, self.close)
+
+    def schedule_session_save(self, *_):
+        if not self._restoring_session:
+            self.session_save_timer.start(600)
+
+    def save_session(self, include_unsaved=True):
+        if self._restoring_session:
+            return
+        inference = self.inference_panel.session_state()
+        state = {
+            "version": 1,
+            "cuda_install_pending": self._cuda_install_pending,
+            "dataset_root": str(self.manager.info.root) if self.manager.info else None,
+            "dataset_classes": self.manager.classes if self.manager.info else [],
+            "current_image": str(self.current_image) if self.current_image else None,
+            "annotation_unsaved": bool(self.unsaved and include_unsaved),
+            "annotation_boxes": ([{"bbox": list(box["bbox"]), "class_id": box.get("class_id")}
+                                  for box in self.canvas.boxes] if self.current_image and self.unsaved and include_unsaved else None),
+            "workspace_tab": self.workspace_tabs.currentIndex(),
+            "training": {
+                "family": self.family_combo.currentText(),
+                "preset": self.model_combo.currentText(),
+                "model_path": self.model_path.text(),
+                "device": self.device_combo.currentData(),
+                "epochs": self.epochs.value(), "imgsz": self.imgsz.value(), "batch": self.batch.value(),
+            },
+            "inference": inference,
+        }
+        try:
+            save_state("session.json", state)
+            if self.inference_panel.last_frame is not None:
+                cv2.imwrite(str(app_state_file("last_detection.png")), self.inference_panel.last_frame)
+        except OSError as exc:
+            self.status.setText(f"Could not save session state: {exc}")
+
+    def restore_session(self):
+        state = load_state("session.json")
+        if not state:
+            return
+        self._restoring_session = True
+        try:
+            training = state.get("training", {})
+            self._cuda_install_pending = bool(state.get("cuda_install_pending", False))
+            family = training.get("family")
+            if family and self.family_combo.findText(family) >= 0:
+                self.family_combo.setCurrentText(family)
+            preset = training.get("preset")
+            if preset and self.model_combo.findText(preset) >= 0:
+                self.model_combo.setCurrentText(preset)
+            self.model_path.setText(training.get("model_path", ""))
+            self.epochs.setValue(int(training.get("epochs", 100)))
+            self.imgsz.setValue(int(training.get("imgsz", 640)))
+            self.batch.setValue(int(training.get("batch", 16)))
+            device_index = self.device_combo.findData(training.get("device"))
+            if device_index >= 0:
+                self.device_combo.setCurrentIndex(device_index)
+
+            dataset_root = state.get("dataset_root")
+            if dataset_root and Path(dataset_root).is_dir():
+                self.load_dataset(dataset_root, quiet=True, restore_classes=state.get("dataset_classes"))
+                image_path = state.get("current_image")
+                if image_path:
+                    row = next((i for i in range(self.image_list.count())
+                                if Path(self.image_list.item(i).data(Qt.UserRole)) == Path(image_path)), -1)
+                    if row >= 0:
+                        self.image_list.setCurrentRow(row)
+                if state.get("annotation_unsaved") and self.current_image and str(self.current_image) == state.get("current_image"):
+                    boxes = state.get("annotation_boxes") or []
+                    self.canvas.set_boxes(boxes)
+                    self.unsaved = True
+                    self.refresh_box_list()
+                self._update_resume_checkpoint(dataset_root)
+            self.inference_panel.restore_session(state.get("inference", {}))
+            preview = cv2.imread(str(app_state_file("last_detection.png")))
+            if preview is not None:
+                self.inference_panel.show_frame(preview)
+            tab = int(state.get("workspace_tab", 0))
+            self.workspace_tabs.setCurrentIndex(max(0, min(tab, self.workspace_tabs.count() - 1)))
+            if self._cuda_install_pending:
+                self.status.setText("A CUDA installation was interrupted. Use Check / Install CUDA PyTorch again from the training tab to continue.")
+        finally:
+            self._restoring_session = False
+
+    def reset_everything(self):
+        answer = QMessageBox.question(
+            self, "Reset everything?",
+            "Clear saved studio session, detection model selections, camera list, video annotator autosave, and current unsaved workspace state?\n\n"
+            "This does not delete dataset files, annotations already saved to disk, training runs, or model checkpoints.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if self.worker and self.worker.isRunning():
+            self._reset_after_training = True
+            self.reset_button.setEnabled(False)
+            self.status.setText("Reset is waiting for training to stop safely and save its last checkpoint…")
+            self.worker.request_stop()
+            return
+        self._perform_reset()
+
+    def _perform_reset(self):
+        self.session_save_timer.stop()
+        self._restoring_session = True
+        self._stop_cuda_install_for_reset()
+        if self.video_annotator_window is not None:
+            self.video_annotator_window.dirty = False
+            self.video_annotator_window.close()
+            self.video_annotator_window = None
+        self.inference_panel.reset_state()
+        self.manager = DatasetManager()
+        self.results_panel.set_dataset_root(None)
+        self.dataset_label.setText("No dataset open")
+        self.image_list.clear()
+        self.images_header.setText("Images")
+        self.canvas.set_image(None)
+        self.canvas.set_class_names([])
+        self.file_label.setText("No image selected")
+        self.current_image = None
+        self.unsaved = False
+        self.refresh_class_combo()
+        self.family_combo.setCurrentIndex(0)
+        self.refresh_model_names()
+        self.model_path.clear()
+        self.epochs.setValue(100)
+        self.imgsz.setValue(640)
+        self.batch.setValue(16)
+        self.device_combo.setCurrentIndex(0)
+        self.train_progress.setValue(0)
+        self.resume_btn.setEnabled(False)
+        self.workspace_tabs.setCurrentIndex(0)
+        clear_saved_state()
+        self._restoring_session = False
+        self.reset_button.setEnabled(True)
+        self.status.setText("Studio state reset. Dataset files and trained checkpoints are still on disk.")
+
+    def _stop_cuda_install_for_reset(self):
+        process = getattr(self, "cuda_process", None)
+        if process and process.state() != QProcess.NotRunning:
+            process.blockSignals(True)
+            process.terminate()
+            if not process.waitForFinished(1500):
+                process.kill()
+                process.waitForFinished(1500)
+        self._cuda_install_pending = False
+
+    def _stop_cuda_install_for_close(self):
+        process = getattr(self, "cuda_process", None)
+        if process and process.state() != QProcess.NotRunning:
+            self._cuda_install_pending = True
+            process.blockSignals(True)
+            process.terminate()
+            if not process.waitForFinished(1500):
+                process.kill()
+                process.waitForFinished(1500)
+
     def closeEvent(self,event):
         if self.unsaved:
             ans=QMessageBox.question(self,"Unsaved","Save current annotation before closing?",QMessageBox.Save|QMessageBox.Discard|QMessageBox.Cancel,QMessageBox.Save)
             if ans==QMessageBox.Save and not self.save_annotation(): event.ignore(); return
             if ans==QMessageBox.Cancel: event.ignore(); return
+            if ans==QMessageBox.Discard:
+                self.unsaved = False
+                self.save_session(include_unsaved=False)
         if self.worker and self.worker.isRunning():
-            QMessageBox.information(self, "Training in progress", "Wait for training to finish before closing the studio.")
-            event.ignore(); return
+            ans=QMessageBox.question(
+                self, "Training in progress",
+                "Stop training safely at the next epoch boundary, save last.pt, and close? You can resume from last.pt next time.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                event.ignore(); return
+            self.save_session()
+            self._close_after_training = True
+            self.status.setText("Training will stop at a safe checkpoint before the studio closes…")
+            self.worker.request_stop()
+            event.ignore()
+            return
+        self._stop_cuda_install_for_close()
+        self.save_session()
         self.inference_panel.stop_and_wait()
         event.accept()
 

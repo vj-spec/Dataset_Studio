@@ -1,5 +1,24 @@
+# Python
 venv/
+.venv/
 __pycache__/
-*.py[cod]
-dataset/runs/
-camera_sources.json
+*.pyc
+
+# AI model weights
+*.pt
+*.pth
+*.onnx
+
+# Generated outputs
+annotated_video.mp4
+runs/
+outputs/
+logs/
+
+# Secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/

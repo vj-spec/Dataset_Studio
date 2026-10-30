@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QAbstractItemView, QSlider, QSpinBox, QDialog, QDialogButtonBox,
     QHeaderView, QProgressBar, QTextEdit,
 )
+from app_state import load_state, save_state
+from config import app_state_file
 
 
 class TrainingResultsPanel(QWidget):
@@ -351,7 +353,7 @@ class DetectWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, models, source_kind, source, confidence, device, source_mode="File", output_video=None,
-                 show_boxes=True, overlay_alpha=0.7, inference_fps=30):
+                 show_boxes=True, overlay_alpha=0.7, inference_fps=30, start_frame=0, imgsz=640):
         super().__init__()
         self.models = models
         self.source_kind = source_kind
@@ -363,6 +365,8 @@ class DetectWorker(QThread):
         self.show_boxes = show_boxes
         self.overlay_alpha = overlay_alpha
         self.inference_fps = max(1, int(inference_fps))
+        self.start_frame = max(0, int(start_frame))
+        self.imgsz = max(32, int(imgsz))
         self._stop_requested = False
         self.writer = None
         self._temporary_video = None
@@ -408,7 +412,11 @@ class DetectWorker(QThread):
             self.video_fps = reported_fps if reported_fps and reported_fps > 0 else 25.0
             self.source_fps.emit(self.video_fps)
             total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-            self.position.emit(0, total_frames)
+            initial_frame = self.start_frame if self.source_kind == "Video" else 0
+            if initial_frame and total_frames:
+                initial_frame = min(initial_frame, max(0, total_frames - 1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, initial_frame)
+            self.position.emit(initial_frame, total_frames)
             self.message.emit(f"Detecting from {self.source_kind.lower()}…")
             next_frame_time = time.perf_counter()
             while not self._stop_requested:
@@ -508,9 +516,13 @@ class DetectWorker(QThread):
         ]
         errors = []
         for attempt, format_selector in enumerate(formats, start=1):
+            if self._stop_requested:
+                raise RuntimeError("Detection stopped by the user.")
             last_percent = [-5]
 
             def report_download(info):
+                if self._stop_requested:
+                    raise yt_dlp.utils.DownloadError("Detection stopped by the user.")
                 if info.get("status") != "downloading":
                     return
                 total = info.get("total_bytes") or info.get("total_bytes_estimate")
@@ -546,6 +558,8 @@ class DetectWorker(QThread):
                         return candidate
                 errors.append("yt-dlp did not produce a video file for the selected format")
             except Exception as exc:
+                if self._stop_requested:
+                    raise RuntimeError("Detection stopped by the user.") from exc
                 errors.append(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)))
                 if attempt < len(formats):
                     self.message.emit(f"That stream was unavailable; trying another format ({attempt + 1}/{len(formats)})…")
@@ -562,7 +576,7 @@ class DetectWorker(QThread):
                 continue
             started = time.perf_counter()
             result = entry["model"].predict(source=frame, classes=entry.get("class_ids") or None,
-                conf=self.confidence, device=self.device, verbose=False)[0]
+                conf=self.confidence, device=self.device, imgsz=self.imgsz, verbose=False)[0]
             timings[entry["name"]] = (time.perf_counter() - started) * 1000.0
             if self.show_boxes:
                 overlay = annotated.copy()
@@ -594,30 +608,36 @@ class DetectWorker(QThread):
 
 
 class InferencePanel(QWidget):
+    state_changed = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.models = []
         self.pending_model_paths = []
         self.model_checks = []
-        self.camera_file = Path(__file__).with_name("camera_sources.json")
+        self.camera_file = app_state_file("cameras.json")
         self.cameras = self.read_cameras()
         self.loader = None
         self.worker = None
+        self._ignore_load_results = False
         self.last_frame = None
+        self.resume_frame = 0
+        self._restoring_session = False
+        self._restore_model_state = {}
         layout = QVBoxLayout(self)
         model_group = QGroupBox("Detection model")
         mf = QFormLayout(model_group)
         row = QHBoxLayout()
         self.model_path = QLineEdit()
-        self.model_path.setPlaceholderText("Choose a trained or external .pt checkpoint")
-        browse = QPushButton("Add .pt files…")
+        self.model_path.setPlaceholderText("Choose trained .pt or exported .onnx / .engine models")
+        browse = QPushButton("Add model files…")
         browse.clicked.connect(self.browse_model)
         row.addWidget(self.model_path, 1)
         row.addWidget(browse)
         self.load_button = QPushButton("Load model and inspect")
         self.load_button.clicked.connect(self.load_model)
         row.addWidget(self.load_button)
-        mf.addRow("Checkpoint:", row)
+        mf.addRow("Model file:", row)
         self.model_details = QLabel("No models loaded")
         self.model_details.setMinimumHeight(24)
         self.model_details.setMaximumHeight(28)
@@ -672,6 +692,13 @@ class InferencePanel(QWidget):
         self.confidence.setSingleStep(0.05)
         self.confidence.setValue(0.25)
         inf.addRow("Confidence:", self.confidence)
+        self.image_size = QComboBox()
+        self.image_size.setEditable(True)
+        self.image_size.addItems(["320", "416", "512", "640", "768", "960", "1024", "1280",
+                                  "1536", "1920", "2048", "2560", "3072", "3840"])
+        self.image_size.setCurrentText("640")
+        self.image_size.setToolTip("Square inference size in pixels. Larger sizes can detect smaller objects but use more memory.")
+        inf.addRow("Image size (px):", self.image_size)
         self.device_combo = QComboBox()
         self.device_combo.addItem("Auto", "")
         self.device_combo.addItem("CPU", "cpu")
@@ -755,9 +782,27 @@ class InferencePanel(QWidget):
         layout.addWidget(split, 1)
         self.update_input_controls()
         self.update_controls()
+        for widget, signal in [
+            (self.model_path, self.model_path.textChanged),
+            (self.source_path, self.source_path.textChanged),
+            (self.input_type, self.input_type.currentTextChanged),
+            (self.source_mode, self.source_mode.currentTextChanged),
+            (self.camera_combo, self.camera_combo.currentIndexChanged),
+            (self.confidence, self.confidence.valueChanged),
+            (self.image_size, self.image_size.currentTextChanged),
+            (self.device_combo, self.device_combo.currentIndexChanged),
+            (self.inference_fps, self.inference_fps.valueChanged),
+            (self.overlay_toggle, self.overlay_toggle.toggled),
+            (self.overlay_alpha, self.overlay_alpha.valueChanged),
+            (self.speed_combo, self.speed_combo.currentTextChanged),
+            (self.video_output, self.video_output.textChanged),
+        ]:
+            signal.connect(self._emit_state_changed)
 
     def browse_model(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select YOLO checkpoints", "", "PyTorch models (*.pt);;All files (*.*)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select YOLO models", "",
+            "YOLO models (*.pt *.onnx *.engine);;PyTorch models (*.pt);;ONNX models (*.onnx);;TensorRT engines (*.engine);;All files (*.*)")
         if paths:
             self.model_path.setText("; ".join(paths))
             self.load_paths(paths)
@@ -770,11 +815,13 @@ class InferencePanel(QWidget):
         self.load_paths(paths)
 
     def load_paths(self, paths):
-        valid = [Path(p) for p in paths if Path(p).is_file()]
+        supported_formats = {".pt", ".onnx", ".engine"}
+        valid = [Path(p) for p in paths if Path(p).is_file() and Path(p).suffix.lower() in supported_formats]
         if not valid:
-            QMessageBox.warning(self, "Model required", "Choose one or more existing .pt model files.")
+            QMessageBox.warning(self, "Model required", "Choose one or more existing .pt, .onnx, or .engine model files.")
             return
         self.pending_model_paths = [str(p) for p in valid]
+        self._ignore_load_results = False
         self.load_button.setEnabled(False)
         self._load_next_model()
 
@@ -791,17 +838,27 @@ class InferencePanel(QWidget):
         self.loader.start()
 
     def model_loaded(self, model, names, details):
+        if self._ignore_load_results:
+            return
         path_line = next((line[6:] for line in details.splitlines() if line.startswith("File: ")), f"model_{len(self.models)+1}.pt")
         entry = {"name": Path(path_line).name, "path": path_line, "model": model, "names": names, "details": details,
                  "enabled": True, "checks": []}
+        stored = self._restore_model_state.get(str(Path(path_line)).casefold())
+        if stored:
+            entry["enabled"] = bool(stored.get("enabled", True))
         self.models.append(entry)
         model_enabled = QCheckBox(f"Run {entry['name']} — {len(names)} classes")
         model_enabled.setChecked(True)
+        model_enabled.setChecked(entry["enabled"])
+        model_enabled.toggled.connect(self._emit_state_changed)
         entry["enabled_check"] = model_enabled
         self.class_layout.addWidget(model_enabled)
         for index, name in enumerate(names):
             check = QCheckBox(name)
             check.setChecked(True)
+            if stored and isinstance(stored.get("classes"), list):
+                check.setChecked(index in stored["classes"])
+            check.toggled.connect(self._emit_state_changed)
             check.setProperty("class_index", index)
             entry["checks"].append(check)
             self.class_layout.addWidget(check)
@@ -810,8 +867,11 @@ class InferencePanel(QWidget):
         self.status.setText(f"Loaded {entry['name']} ({len(names)} class(es)).")
         self._load_next_model()
         self.update_controls()
+        self._emit_state_changed()
 
     def model_failed(self, error):
+        if self._ignore_load_results:
+            return
         self.status.setText(error)
         QMessageBox.critical(self, "Model load failed", error)
         self._load_next_model()
@@ -869,6 +929,13 @@ class InferencePanel(QWidget):
         return selected if selected and len(selected) < len(entry["checks"]) else []
 
     def start_detection(self):
+        try:
+            imgsz = int(self.image_size.currentText().strip())
+            if imgsz < 32 or imgsz > 4096:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Invalid image size", "Enter an image size from 32 to 4096 pixels.")
+            return
         active_models = []
         for entry in self.models:
             entry["class_ids"] = self.selected_classes(entry)
@@ -890,9 +957,11 @@ class InferencePanel(QWidget):
             except ValueError as exc:
                 QMessageBox.warning(self, "Invalid URL", str(exc))
                 return
+        start_frame = self.resume_frame if kind == "Video" and not self.video_output.text().strip() else 0
         self.worker = DetectWorker(active_models, kind, source, self.confidence.value(), self.device_combo.currentData(), source_mode,
             self.video_output.text().strip() if kind == "Video" and self.video_output.text().strip() else None,
-            self.overlay_toggle.isChecked(), self.overlay_alpha.value() / 100.0, self.inference_fps.value())
+            self.overlay_toggle.isChecked(), self.overlay_alpha.value() / 100.0, self.inference_fps.value(), start_frame, imgsz)
+        self.resume_frame = 0
         self.worker.frame_ready.connect(self.show_frame)
         self.worker.message.connect(self.status.setText)
         self.worker.position.connect(self.update_playback_position)
@@ -909,6 +978,7 @@ class InferencePanel(QWidget):
         self.playback_button.setText("Pause")
         self.worker.set_speed(float(self.speed_combo.currentText().rstrip("x")))
         self.worker.start()
+        self._emit_state_changed()
 
     def stop_detection(self):
         if self.worker:
@@ -957,6 +1027,9 @@ class InferencePanel(QWidget):
         else:
             self.seek_slider.setEnabled(False)
             self.position_label.setText(f"Frame {frame}")
+        if frame % 30 == 0:
+            self.resume_frame = frame
+            self._emit_state_changed()
 
     def show_frame(self, frame):
         self.last_frame = frame
@@ -978,6 +1051,7 @@ class InferencePanel(QWidget):
         self.playback_button.setEnabled(False)
         self.seek_slider.setEnabled(False)
         self.status.setText("Detection finished.")
+        self._emit_state_changed()
 
     def save_image(self):
         if self.last_frame is None:
@@ -994,6 +1068,96 @@ class InferencePanel(QWidget):
 
     def update_controls(self):
         self.run_button.setEnabled(bool(self.models))
+
+    def _emit_state_changed(self, *_):
+        if not self._restoring_session:
+            self.state_changed.emit()
+
+    def session_state(self):
+        selected_camera = self.camera_combo.currentData()
+        if self.input_type.currentText() == "Video" and self.worker and self.worker.isRunning():
+            self.resume_frame = max(self.resume_frame, self.seek_slider.value())
+        return {
+            "model_paths": [entry["path"] for entry in self.models] or [p.strip().strip('"') for p in self.model_path.text().split(";") if p.strip()],
+            "models": {str(Path(entry["path"])).casefold(): {
+                "enabled": entry["enabled_check"].isChecked(),
+                "classes": [index for index, check in enumerate(entry["checks"]) if check.isChecked()],
+            } for entry in self.models},
+            "source_type": self.input_type.currentText(),
+            "source_mode": self.source_mode.currentText(),
+            "source": self.source_path.text(),
+            "camera_source": str(selected_camera) if selected_camera is not None else None,
+            "confidence": self.confidence.value(),
+            "image_size": self.image_size.currentText(),
+            "device": self.device_combo.currentData(),
+            "inference_fps": self.inference_fps.value(),
+            "overlay": self.overlay_toggle.isChecked(),
+            "overlay_alpha": self.overlay_alpha.value(),
+            "speed": self.speed_combo.currentText(),
+            "video_output": self.video_output.text(),
+            "resume_frame": self.resume_frame,
+        }
+
+    def restore_session(self, state):
+        self._restoring_session = True
+        try:
+            self.input_type.setCurrentText(state.get("source_type", "Image"))
+            self.source_mode.setCurrentText(state.get("source_mode", "File"))
+            self.source_path.setText(state.get("source", ""))
+            self.confidence.setValue(float(state.get("confidence", .25)))
+            self.image_size.setCurrentText(str(state.get("image_size", "640")))
+            self.inference_fps.setValue(int(state.get("inference_fps", 15)))
+            self.overlay_toggle.setChecked(bool(state.get("overlay", True)))
+            self.overlay_alpha.setValue(int(state.get("overlay_alpha", 70)))
+            self.speed_combo.setCurrentText(state.get("speed", "1.0x"))
+            self.video_output.setText(state.get("video_output", ""))
+            self.resume_frame = max(0, int(state.get("resume_frame", 0)))
+            device = state.get("device")
+            device_index = self.device_combo.findData(device)
+            if device_index >= 0: self.device_combo.setCurrentIndex(device_index)
+            camera_index = self.camera_combo.findData(state.get("camera_source"))
+            if camera_index >= 0: self.camera_combo.setCurrentIndex(camera_index)
+            self._restore_model_state = state.get("models", {})
+            paths = [path for path in state.get("model_paths", []) if Path(path).is_file()]
+            if paths:
+                self.model_path.setText("; ".join(paths))
+                self.load_paths(paths)
+        finally:
+            self._restoring_session = False
+        self.update_input_controls()
+
+    def reset_state(self):
+        self._ignore_load_results = True
+        self.stop_and_wait()
+        self.models.clear()
+        self.pending_model_paths.clear()
+        self._restore_model_state.clear()
+        self.model_path.clear()
+        self.model_details.setText("No models loaded")
+        self.details_button.setEnabled(False)
+        while self.class_layout.count():
+            item = self.class_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.input_type.setCurrentText("Image")
+        self.source_mode.setCurrentText("File")
+        self.source_path.clear()
+        self.video_output.clear()
+        self.confidence.setValue(.25)
+        self.image_size.setCurrentText("640")
+        self.device_combo.setCurrentIndex(0)
+        self.inference_fps.setValue(15)
+        self.overlay_toggle.setChecked(True)
+        self.overlay_alpha.setValue(70)
+        self.speed_combo.setCurrentText("1.0x")
+        self.resume_frame = 0
+        self.last_frame = None
+        self.preview.setPixmap(QPixmap())
+        self.preview.setText("Detection output appears here")
+        self.metrics_label.setText("Inference: —")
+        self.camera_fps_label.setText("Camera FPS: —")
+        self.cameras = self.read_cameras()
+        self.refresh_cameras()
+        self.update_controls()
 
     def update_metrics(self, timings):
         self.metrics_label.setText("Inference: " + (" | ".join(f"{name}: {ms:.1f} ms" for name, ms in timings.items()) or "—"))

@@ -1,6 +1,13 @@
 from pathlib import Path
+import os
 
 APP_ROOT = Path(__file__).resolve().parent
+APP_STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "IntrinoTech" / "YOLODatasetStudio"
+
+def app_state_file(name: str) -> Path:
+    APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return APP_STATE_DIR / name
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 YOLO_FAMILIES = [
