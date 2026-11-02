@@ -341,7 +341,10 @@ def read_boxes(fmt: str, source: Path | None, image_path: Path, width: int, heig
             image_node = next((node for node in root.findall("image")
                                if Path(node.get("name", "")).name.casefold() == image_path.name.casefold()), None)
             nodes = image_node.findall("box") if image_node is not None else []
-            if not nodes:
+            # An explicit image annotation, including an empty image node, wins
+            # over track interpolation. This lets dataset edits persist an
+            # intentionally cleared frame without resurrecting its track box.
+            if image_node is None:
                 image_root = source.parent / "images"
                 frame_paths = sorted((p for p in image_root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS),
                                      key=lambda p: str(p).casefold())
@@ -431,7 +434,8 @@ def write_boxes(fmt: str, source: Path | None, root: Path, image_path: Path, wid
         ET.indent(annotation, space="  ")
         target.write_bytes(ET.tostring(annotation, encoding="utf-8", xml_declaration=True))
     elif fmt == "labelme":
-        target = image_path.with_suffix(".json")
+        target = _labelme_json_for_image(source, image_path) if source else None
+        target = target or image_path.with_suffix(".json")
         payload = {"version": "5.0.0", "flags": {}, "shapes": [], "imagePath": image_path.name,
                    "imageData": None, "imageHeight": height, "imageWidth": width}
         for cid, x1, y1, x2, y2 in rows:

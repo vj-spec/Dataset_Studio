@@ -1,24 +1,41 @@
-# Python
+# Python environments
 venv/
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 
-# AI model weights
-*.pt
-*.pth
-*.onnx
+# Temporary files and test artifacts
+tmp*/
+tmp_*/
+*.tmp
 
-# Generated outputs
-annotated_video.mp4
+# Training outputs and datasets
 runs/
-outputs/
-logs/
+datasets/
+recordings/
 
-# Secrets
+# Model weights
+*.pt
+*.onnx
+*.engine
+
+# Logs and caches
+*.log
+.cache/
+.pytest_cache/
+
+# Secrets and private keys
 .env
 .env.*
+*.key
+*.pem
+*.p12
+*.pfx
 
-# IDE
-.vscode/
-.idea/
+# Generated test state
+tests/_phase5_state/
+tmp*/
+tmp_*/
+
+# Generated media
+*.mp4

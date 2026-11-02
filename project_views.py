@@ -32,6 +32,7 @@ class TrainingResultsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.run_root = None
+        self.extra_run_roots = []
         layout = QVBoxLayout(self)
         bar = QHBoxLayout()
         self.root_label = QLabel("Open a dataset to browse its training runs.")
@@ -71,15 +72,28 @@ class TrainingResultsPanel(QWidget):
 
     def set_dataset_root(self, root):
         self.run_root = Path(root) / "runs" if root else None
-        self.root_label.setText(str(self.run_root) if self.run_root else "Open a dataset to browse its training runs.")
+        self._update_roots_label()
         self.refresh_runs()
+
+    def add_run_root(self, root):
+        path = Path(root).expanduser().resolve()
+        if path not in self.extra_run_roots:
+            self.extra_run_roots.append(path)
+        self._update_roots_label()
+        self.refresh_runs()
+
+    def _update_roots_label(self):
+        roots = ([self.run_root] if self.run_root else []) + list(self.extra_run_roots)
+        self.root_label.setText("Training outputs: " + " · ".join(str(root) for root in roots) if roots else "Open a dataset to browse its training runs.")
 
     def refresh_runs(self):
         self.runs.clear()
-        if not self.run_root or not self.run_root.is_dir():
+        roots = ([self.run_root] if self.run_root else []) + list(self.extra_run_roots)
+        roots = [root for root in roots if root and root.is_dir()]
+        if not roots:
             self.show_empty()
             return
-        found = sorted({p.parent for p in self.run_root.rglob("results.csv")}, key=lambda p: p.stat().st_mtime, reverse=True)
+        found = sorted({p.parent for root in roots for p in root.rglob("results.csv")}, key=lambda p: p.stat().st_mtime, reverse=True)
         for folder in found:
             self.runs.addItem(f"{folder.name}  —  {folder.parent.name}")
             self.runs.item(self.runs.count() - 1).setData(Qt.UserRole, str(folder))

@@ -4,6 +4,7 @@ import platform
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 @dataclass
@@ -13,13 +14,17 @@ class GPUInfo:
     memory_mb: Optional[int]
     driver: str = ""
     torch_cuda: bool = False
+    vendor: str = "NVIDIA"
+    memory_used_mb: Optional[int] = None
+    memory_free_mb: Optional[int] = None
+    utilization_percent: Optional[float] = None
 
 def _run_nvidia_smi():
     try:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=index,name,memory.total,driver_version",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,driver_version",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -37,17 +42,17 @@ def _run_nvidia_smi():
                     idx = int(parts[0])
                 except ValueError:
                     continue
-                mem = None
-                if len(parts) >= 3:
-                    try:
-                        mem = int(float(parts[2]))
-                    except ValueError:
-                        pass
+                def number(index, cast=int):
+                    try: return cast(float(parts[index]))
+                    except (ValueError, IndexError): return None
+                mem = number(2)
                 rows.append(GPUInfo(
                     index=idx,
                     name=parts[1],
                     memory_mb=mem,
-                    driver=parts[3] if len(parts) >= 4 else "",
+                    driver=parts[6] if len(parts) >= 7 else "",
+                    vendor="NVIDIA", memory_used_mb=number(3), memory_free_mb=number(4),
+                    utilization_percent=number(5, float),
                 ))
         return rows
     except (FileNotFoundError, subprocess.SubprocessError, OSError):
@@ -58,6 +63,21 @@ def detect_hardware():
     torch_version = None
     torch_cuda_version = None
     torch_cuda_available = False
+    cpu_info = {"name": platform.processor() or platform.machine(), "physical_cores": None,
+                "logical_cores": None, "utilization_percent": None}
+    memory = {"total_mb": None, "available_mb": None, "used_mb": None}
+    disk = {"path": str(Path.home()), "free_gb": None, "total_gb": None}
+    try:
+        import psutil
+        cpu_info.update(physical_cores=psutil.cpu_count(logical=False), logical_cores=psutil.cpu_count(logical=True),
+                        utilization_percent=psutil.cpu_percent(interval=None))
+        vm = psutil.virtual_memory()
+        memory.update(total_mb=int(vm.total / (1024 * 1024)), available_mb=int(vm.available / (1024 * 1024)),
+                      used_mb=int(vm.used / (1024 * 1024)))
+        usage = psutil.disk_usage(str(Path.home().anchor or Path.home()))
+        disk.update(free_gb=round(usage.free / (1024 ** 3), 2), total_gb=round(usage.total / (1024 ** 3), 2))
+    except Exception:
+        pass
 
     try:
         import torch
@@ -79,6 +99,7 @@ def detect_hardware():
                         name=props.name,
                         memory_mb=int(props.total_memory / (1024 * 1024)),
                         torch_cuda=True,
+                        vendor="NVIDIA" if "nvidia" in str(props.name).lower() else "Unknown",
                     ))
     except Exception:
         pass
@@ -86,12 +107,30 @@ def detect_hardware():
     return {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
+        "cpu": cpu_info,
+        "memory": memory,
+        "disk": disk,
         "gpus": gpus,
         "nvidia_gpu_detected": bool(gpus),
         "torch_version": torch_version,
         "torch_cuda_version": torch_cuda_version,
         "torch_cuda_available": torch_cuda_available,
+        "torch_cuda_compatible": bool(torch_cuda_available),
+        "training_framework_versions": _framework_versions(),
+        "supported_training_architectures": ["YOLO", "RT-DETR"],
     }
+
+
+def _framework_versions():
+    versions = {}
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        for package in ("ultralytics", "torch"):
+            try: versions[package] = version(package)
+            except PackageNotFoundError: pass
+    except Exception:
+        pass
+    return versions
 
 def cuda_install_command():
     # We deliberately do not guess a CUDA Toolkit version. PyTorch wheels

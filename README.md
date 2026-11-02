@@ -1,92 +1,62 @@
-# YOLO Dataset & Training Studio
+# Dataset Studio
 
-See [USER_MANUAL.md](USER_MANUAL.md) for setup instructions and complete workflows for dataset annotation, YOLO preparation, training, detection, model export, and video annotation.
+Dataset Studio is a local PySide6 desktop application for preparing object-detection datasets, annotating and validating images, training supported models, reviewing experiments, and running inference. It also includes dataset merging and a Compute Center for local scheduling and authenticated worker monitoring.
 
-Compact PySide6 desktop application for:
-- creating a new dataset explicitly
-- opening an existing raw annotation dataset
-- opening an existing prepared YOLO dataset
-- importing YOLO TXT, COCO JSON, Pascal VOC XML, LabelMe JSON, and CVAT XML/ZIP object-detection annotations
-- image annotation with YOLO bounding boxes
-- dataset file browser with image preview
-- class management
-- YOLO dataset preparation to a user-selected output directory
-- model selection across YOLO26, YOLO12, YOLO11, YOLOv10, YOLOv9, YOLOv8, YOLOv6 and YOLOv5
-- CPU / CUDA GPU selection
-- NVIDIA GPU detection
-- optional CUDA-enabled PyTorch installation into the active Python environment
-- YOLO training in a worker thread
-- per-epoch training progress, run metrics history, and checkpoint export
-- model inspection and image/video/webcam inference with class filters, configurable image sizes, and `.pt`, `.onnx`, and TensorRT `.engine` model files
-- photo URLs and supported video page links (including YouTube) for detection; annotated photos/videos can be saved
-- URL videos are downloaded to a temporary file before processing so playback controls and seeking work with OpenCV; the temporary source is removed afterward
-- separate sawing-machine safety video annotation window with temporal object tracks, interpolated keyframes, project save/load, annotated video export, and YOLO dataset export
-- resumable studio sessions for datasets, unsaved image annotations, detection setup and video position; training can stop at an epoch checkpoint and resume from `last.pt`+- a confirmed Reset Everything action clears saved app/session state while preserving dataset files, saved annotations, training runs and model checkpoints
+## Start here
 
-## Safety behavior
+- [Workflow guide](WORKFLOW.md) — recommended end-to-end tasks from dataset intake to training and inference.
+- [Two-computer quick start](QUICK_START.md) — connect a controller and worker and submit a first remote run.
+- [Phase 6 operating guide](PHASE_6_GUIDE.md) — detailed network setup, worker compatibility, transfers, recovery, and troubleshooting.
+- [User manual](USER_MANUAL.md) — detailed UI instructions, dataset formats, recovery, training, Compute Center, and troubleshooting.
+- [Project file guide](PROJECT_GUIDE.md) — what the main files and modules contain.
+- [Development audit](DEVELOPMENT_AUDIT.md) — implementation scope, verification history, and limitations.
 
-The application never creates a `dataset/` folder at startup.
+## Main capabilities
 
-It never recursively deletes an output directory.
+- Open or create raw annotation datasets; browse and edit bounding boxes and classes; validate data and undo supported operations.
+- Prepare YOLO datasets or explicitly reconcile classes and merge compatible YOLO datasets into a new output folder.
+- Train supported Ultralytics YOLO and RT-DETR models, review experiment history, compare metrics, evaluate runs, and register checkpoints.
+- Run image, video, camera, and supported URL inference; export compatible models; annotate video tracks manually in the Video Annotator.
+- Use Compute Center in Controller, Worker, or Hybrid mode. Enrolled workers can receive validated YOLO and RT-DETR jobs over the existing TLS connection, verify and cache transferred datasets, report progress, and return verified checkpoints and training files.
 
-Preparation refuses to use the source dataset, the application root, or the Python `venv` as the output.
+## Requirements and installation
 
-Only the explicitly selected YOLO output folder is created/modified by preparation.
+Use a Python environment compatible with the installed PySide6, PyTorch, OpenCV, and Ultralytics versions. Current workspace checks use Windows, Python 3.11.9, PySide6 6.12.0, PyTorch 2.15.0 CPU-only, and Ultralytics 8.4.197. CUDA is not available in this environment.
 
-## Dataset formats
+From PowerShell in this project folder:
 
-Raw:
-```
-project/
-  images/
-  labels/          # or annotations/
-  classes.txt      # optional when data.yaml provides names
-```
-
-Prepared YOLO:
-```
-project/
-  images/
-    train/
-    val/
-  labels/
-    train/
-    val/
-  data.yaml
-```
-
-If `classes.txt` is missing:
-1. `data.yaml` names are used when available and `classes.txt` is created.
-2. Otherwise class IDs are detected from label files and the UI asks for class names.
-3. If no labels/classes exist, you can add classes manually before annotation.
-
-## Install
-
-Use the active virtual environment:
-
-```
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python main.py
 ```
 
-## CUDA note
+If you already have a project virtual environment, activate and reuse it instead of creating another. `requirements.txt` lists the application’s base dependencies. ONNX Runtime and TensorRT are optional inference runtimes and are not included in the base requirements. GPU training requires a compatible NVIDIA driver and a CUDA-enabled PyTorch build; do not install a different PyTorch build without checking compatibility with the driver and Python version.
 
-The app can detect NVIDIA GPUs through `nvidia-smi` and check whether the current PyTorch build can use CUDA.
+## Where files are saved
 
-The optional CUDA installation installs a CUDA-enabled PyTorch wheel into the current Python environment. It does NOT install or update the NVIDIA display driver or the system CUDA Toolkit. A compatible NVIDIA driver is still required.
+- Dataset annotations, classes, prepared datasets, and training outputs are saved under the selected dataset or output folders.
+- Experiment and Compute Center SQLite state defaults to `%LOCALAPPDATA%\IntrinoTech\YOLODatasetStudio` on Windows. Set `DATASET_STUDIO_STATE_DIR` before launch to use a different app-state folder.
+- Recovery snapshots for dataset edits are stored inside that dataset in `.dataset_studio_recovery`.
+- Merge and fine-tuning outputs are written to new user-selected folders; source datasets and original model weights are not modified by those workflows.
 
-The included CUDA installer uses the official PyTorch CUDA 13.2 wheel index and installs torch 2.13.0 + torchvision 0.28.0 into the active environment. If your NVIDIA driver does not support that runtime, use the PyTorch selector to choose a compatible build instead.
+## Safety and scope
 
-## Detection model files and image size
+The application does not create a dataset folder on startup or delete nonempty preparation outputs automatically. Dataset deletion and destructive annotation actions require confirmation and supported dataset edits have undo snapshots. Training and merge outputs should be saved to locations with sufficient free space.
 
-The Detect tab accepts Ultralytics `.pt` checkpoints, ONNX `.onnx` models, and TensorRT `.engine` models. Choose an inference image size from the list (including 640, 960, and 1280) or type a custom size from 32 to 4096 pixels. Larger sizes can help with small objects and use more memory. The selected size is saved with the studio session.
+Compute Center requires explicit user action to start a TLS controller listener or connect a worker. Worker enrollment requires a one-time token and controller approval. Worker credentials use Windows DPAPI. Remote jobs are limited to the predefined YOLO and RT-DETR adapters and validated training parameters; workers do not accept shell commands or Python code. Dataset and artifact content is hash-verified. This workspace has automated mocked-network verification but no physical two-computer acceptance result. See [Phase 6 operating guide](PHASE_6_GUIDE.md) and [two-computer quick start](QUICK_START.md) before connecting machines.
 
-ONNX inference needs ONNX Runtime in the active environment. Install the CPU runtime with `python -m pip install onnxruntime`; for a compatible NVIDIA setup, use `onnxruntime-gpu` instead. TensorRT engines need the NVIDIA GPU and a compatible TensorRT runtime; engine files can also require the image dimensions and TensorRT version they were built for. These optional runtimes are not installed by the base requirements.
+## Development status
 
-## Model support note
+Phases 1–5 are present. Phase 6 remote execution is implemented and covered by automated tests for protocol messages, dataset/cache handling, mocked remote YOLO/RT-DETR execution, progress, and artifact receipt. Physical multi-computer testing, automatic reconciliation after a worker restart, and automatic resume/retry after a long outage remain unverified or incomplete. See [development audit](DEVELOPMENT_AUDIT.md) for current evidence and limits.
 
-The UI lists the requested Ultralytics YOLO families. Exact pretrained checkpoint availability depends on the installed Ultralytics release. YOLOv6, for example, may require a YAML architecture because current Ultralytics documentation does not publish YOLOv6 `.pt` checkpoints. A local `.pt`, `.onnx`, or `.engine` can be selected through Browse Model.
+## Tests
 
-Official documentation:
-https://docs.ultralytics.com/models
-https://docs.ultralytics.com/quickstart
+Run the suite from the project folder:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Some tests perform small real CPU training runs and can take a couple of minutes. To keep application state isolated during tests, set `DATASET_STUDIO_STATE_DIR` to a temporary or test-only directory before running them.

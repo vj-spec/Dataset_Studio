@@ -13,8 +13,11 @@ class TrainingWorker(QThread):
     epoch_progress = Signal(int, int, str)
     finished_ok = Signal(str)
     failed = Signal(str)
+    lifecycle = Signal(str)
+    metrics_row = Signal(int, object)
 
-    def __init__(self, model_name, data_yaml, device, epochs, imgsz, batch, project_dir, resume=False):
+    def __init__(self, model_name, data_yaml, device, epochs, imgsz, batch, project_dir, resume=False,
+                 train_options=None, run_name="train"):
         super().__init__()
         self.model_name = model_name
         self.data_yaml = str(data_yaml)
@@ -24,6 +27,8 @@ class TrainingWorker(QThread):
         self.batch = int(batch)
         self.project_dir = str(project_dir)
         self.resume = bool(resume)
+        self.train_options = dict(train_options or {})
+        self.run_name = str(run_name or "train")
         self._stop_requested = threading.Event()
         self._trainer = None
 
@@ -41,6 +46,7 @@ class TrainingWorker(QThread):
             model = YOLO(self.model_name)
 
             def report_batch(trainer):
+                self.lifecycle.emit("running")
                 batch = int(getattr(trainer, "batch_i", -1)) + 1
                 batches = int(getattr(trainer, "nb", 0) or 0)
                 if batch == 1 or batch % 5 == 0 or (batches and batch == batches):
@@ -56,10 +62,12 @@ class TrainingWorker(QThread):
                     self.progress.emit(text)
 
             def on_pretrain(trainer):
+                self.lifecycle.emit("preparing")
                 self.message.emit("Preparing dataset and training environment…")
 
             def on_train_start(trainer):
                 self._trainer = trainer
+                self.lifecycle.emit("running")
                 if self._stop_requested.is_set():
                     trainer.stop = True
 
@@ -77,6 +85,8 @@ class TrainingWorker(QThread):
                        if isinstance(v, (int, float))}
                 epoch = trainer.epoch + 1
                 detail = ", ".join(f"{k}={v:.4f}" for k, v in row.items())
+                self.lifecycle.emit("validating")
+                self.metrics_row.emit(epoch, row)
                 self.progress.emit(f"{epoch}/{trainer.epochs} | {detail}")
                 self.epoch_progress.emit(epoch, trainer.epochs, detail)
 
@@ -96,8 +106,9 @@ class TrainingWorker(QThread):
                     batch=self.batch,
                     device=self.device,
                     project=self.project_dir,
-                    name="train",
+                    name=self.run_name,
                     exist_ok=True,
+                    **self.train_options,
                 )
 
             save_dir = getattr(results, "save_dir", None)

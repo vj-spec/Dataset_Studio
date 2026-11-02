@@ -2,7 +2,7 @@ from pathlib import Path
 import os
 
 APP_ROOT = Path(__file__).resolve().parent
-APP_STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "IntrinoTech" / "YOLODatasetStudio"
+APP_STATE_DIR = Path(os.environ.get("DATASET_STUDIO_STATE_DIR", str(Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "IntrinoTech" / "YOLODatasetStudio")))
 
 def app_state_file(name: str) -> Path:
     APP_STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -29,6 +29,10 @@ MODEL_PRESETS = {
     "YOLOv6": [f"yolov6{v}.pt" for v in YOLO_VARIANTS],
     "YOLOv5": [f"yolov5{v}u.pt" for v in YOLO_VARIANTS],
 }
+
+RTDETR_MODEL_PRESETS = [
+    "rtdetr-l.pt", "rtdetr-x.pt", "rtdetr-resnet50.yaml", "rtdetr-resnet101.yaml",
+]
 
 TASKS = ["detect", "segment", "classify", "pose", "obb"]
 

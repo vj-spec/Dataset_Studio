@@ -5,6 +5,7 @@ import subprocess
 import time
 import platform
 import socket
+import json
 from pathlib import Path
 
 import cv2
@@ -15,10 +16,10 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
     QComboBox, QInputDialog, QMessageBox, QFileDialog, QSizePolicy,
     QSpinBox, QDoubleSpinBox, QLineEdit, QFormLayout, QTabWidget, QProgressBar,
-    QDialog, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView
+    QDialog, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
 )
 
-from config import MODEL_PRESETS, YOLO_FAMILIES, app_state_file
+from config import MODEL_PRESETS, RTDETR_MODEL_PRESETS, YOLO_FAMILIES, app_state_file
 from dataset_manager import DatasetManager, DatasetError
 from hardware import detect_hardware, cuda_install_command
 from yolo_trainer import TrainingWorker
@@ -27,6 +28,12 @@ from dataset_browser import DatasetBrowserDialog
 from annotation_formats import SUPPORTED_FORMATS
 from video_annotator import VideoAnnotatorWindow
 from app_state import load_state, save_state, clear_saved_state
+from class_manager import ClassManagerDialog
+from training_framework import TrainingConfig, TrainingManager
+from experiment_database import ExperimentDatabase
+from experiment_studio import ExperimentManagerPanel, ModelComparisonPanel, ModelRegistryPanel
+from compute_manager import UnifiedComputeManager
+from compute_studio import ComputeCenterPanel
 
 
 class TaskManagerPerformanceDialog(QDialog):
@@ -514,6 +521,12 @@ class DrillAnnotationStudio(QMainWindow):
         self.current_image = None
         self.unsaved = False
         self.worker = None
+        self.training_manager = TrainingManager(parent=self)
+        self.experiment_database = ExperimentDatabase()
+        self.training_manager.set_experiment_database(self.experiment_database)
+        self.compute_manager = UnifiedComputeManager(self.experiment_database, self)
+        self._training_managers = {}
+        self.training_manager.lifecycle_changed.connect(self._training_lifecycle_changed)
         self.video_annotator_window = None
         self._close_after_training = False
         self._reset_after_training = False
@@ -553,6 +566,8 @@ class DrillAnnotationStudio(QMainWindow):
         top.addWidget(self._button("Open Dataset…", self.open_existing))
         top.addWidget(self._button("Open CVAT ZIP…", self.open_cvat_archive))
         top.addWidget(self._button("Browse Files & Preview…", self.browse_dataset_files))
+        top.addWidget(self._button("Dataset Merge Studio…", self.open_merge_studio, "Combine selected YOLO datasets with explicit class reconciliation"))
+        top.addWidget(self._button("Fine-Tuning Prep…", self.open_fine_tuning_prep, "Map a YOLO dataset to pretrained detection model classes"))
         top.addWidget(self._button("New Dataset…", self.create_new))
         top.addWidget(self._button("Performance", self.show_performance))
         top.addWidget(self._button("Model Exchange", self.show_model_exchange))
@@ -580,6 +595,15 @@ class DrillAnnotationStudio(QMainWindow):
         self.workspace_tabs.addTab(workspace, "Dataset & Training")
         self.workspace_tabs.addTab(self.results_panel, "Training Results")
         self.workspace_tabs.addTab(self.inference_panel, "Detect")
+        self.experiment_panel = ExperimentManagerPanel(self.experiment_database, self.training_manager, self)
+        self.experiment_panel.active_training_managers = self._training_managers
+        self.workspace_tabs.addTab(self.experiment_panel, "Experiments")
+        self.comparison_panel = ModelComparisonPanel(self.experiment_database, self)
+        self.workspace_tabs.addTab(self.comparison_panel, "Model Comparison")
+        self.model_registry_panel = ModelRegistryPanel(self.experiment_database, self)
+        self.workspace_tabs.addTab(self.model_registry_panel, "Model Registry")
+        self.compute_center = ComputeCenterPanel(self.compute_manager, self)
+        self.workspace_tabs.addTab(self.compute_center, "Compute Center")
         self.workspace_tabs.currentChanged.connect(lambda _index: self.schedule_session_save())
         self.inference_panel.state_changed.connect(self.schedule_session_save)
         root.addWidget(self.workspace_tabs, 1)
@@ -655,7 +679,7 @@ class DrillAnnotationStudio(QMainWindow):
         cl.addWidget(self.class_combo)
         row = QHBoxLayout()
         row.addWidget(self._button("Add…", self.add_class))
-        row.addWidget(self._button("Delete", self.delete_class, "Delete class and rewrite all label IDs"))
+        row.addWidget(self._button("Class Manager…", self.show_class_manager, "Class counts, validation, recovery, and safe class operations"))
         cl.addLayout(row)
         layout.addWidget(classes)
 
@@ -709,6 +733,10 @@ class DrillAnnotationStudio(QMainWindow):
         self.family_combo.addItems(YOLO_FAMILIES)
         self.family_combo.currentTextChanged.connect(self.refresh_model_names)
         mf.addRow("Family:", self.family_combo)
+        self.architecture_combo = QComboBox()
+        self.architecture_combo.addItems(["YOLO", "RT-DETR"])
+        self.architecture_combo.currentTextChanged.connect(self.refresh_model_names)
+        mf.insertRow(0, "Architecture:", self.architecture_combo)
         self.model_combo = QComboBox()
         mf.addRow("Preset:", self.model_combo)
         self.model_path = QLineEdit()
@@ -746,15 +774,67 @@ class DrillAnnotationStudio(QMainWindow):
         self.batch.setValue(16)
         self.batch.setToolTip("-1 = auto batch size")
         pf.addRow("Batch:", self.batch)
+        self.train_dataset_info = QLabel("Training dataset classes are read from the selected dataset YAML.")
+        self.train_dataset_info.setWordWrap(True); self.train_dataset_info.setObjectName("hint")
+        pf.addRow(self.train_dataset_info)
         layout.addWidget(params)
 
+        self.advanced_toggle = QPushButton("Show advanced configuration ▸")
+        self.advanced_toggle.setCheckable(True)
+        layout.addWidget(self.advanced_toggle)
+        advanced = QWidget()
+        af = QFormLayout(advanced)
+        self.experiment_name = QLineEdit("train")
+        self.experiment_name.textChanged.connect(lambda: self._update_resume_checkpoint(self.manager.info.root if self.manager.info else None))
+        af.addRow("Experiment:", self.experiment_name)
+        self.output_directory_edit = QLineEdit(); self.output_directory_edit.setPlaceholderText("Default: runs/train beside the dataset")
+        output_row = QHBoxLayout(); output_row.addWidget(self.output_directory_edit, 1)
+        output_row.addWidget(self._button("Browse…", self.browse_training_output)); af.addRow("Output folder:", output_row)
+        self.output_directory_edit.textChanged.connect(lambda: self._update_resume_checkpoint(self.manager.info.root if self.manager.info else None))
+        self.learning_rate = QDoubleSpinBox(); self.learning_rate.setDecimals(6); self.learning_rate.setRange(0.000001, 1.0); self.learning_rate.setValue(0.01)
+        af.addRow("Initial learning rate:", self.learning_rate)
+        self.weight_decay = QDoubleSpinBox(); self.weight_decay.setDecimals(7); self.weight_decay.setRange(0.0, 1.0); self.weight_decay.setValue(0.0005)
+        af.addRow("Weight decay:", self.weight_decay)
+        self.optimizer_combo = QComboBox(); self.optimizer_combo.addItems(["auto", "SGD", "Adam", "AdamW"])
+        af.addRow("Optimizer:", self.optimizer_combo)
+        self.scheduler_combo = QComboBox(); self.scheduler_combo.addItem("Framework default", "default"); self.scheduler_combo.addItem("Cosine", "cosine")
+        af.addRow("Scheduler:", self.scheduler_combo)
+        self.workers_spin = QSpinBox(); self.workers_spin.setRange(0, 64); self.workers_spin.setValue(0)
+        af.addRow("Data workers:", self.workers_spin)
+        self.patience_spin = QSpinBox(); self.patience_spin.setRange(0, 1000); self.patience_spin.setValue(100)
+        af.addRow("Early stopping patience:", self.patience_spin)
+        self.save_period_spin = QSpinBox(); self.save_period_spin.setRange(-1, 1000); self.save_period_spin.setValue(-1)
+        self.save_period_spin.setToolTip("-1 disables extra periodic checkpoint copies; best.pt and last.pt remain enabled.")
+        af.addRow("Checkpoint period:", self.save_period_spin)
+        self.precision_combo = QComboBox(); self.precision_combo.addItem("Automatic (YOLO)", "auto"); self.precision_combo.addItem("FP32", "fp32"); self.precision_combo.addItem("FP16 (CUDA)", "fp16")
+        af.addRow("Precision:", self.precision_combo)
+        self.freeze_spin = QSpinBox(); self.freeze_spin.setRange(-1, 1000); self.freeze_spin.setValue(-1)
+        af.addRow("Freeze first N layers:", self.freeze_spin)
+        self.validate_each_epoch = QCheckBox("Run validation each epoch"); self.validate_each_epoch.setChecked(True)
+        af.addRow(self.validate_each_epoch)
+        self.mosaic_aug = QCheckBox("Use YOLO mosaic augmentation")
+        self.mosaic_aug.setChecked(True)
+        self.mosaic_aug.setToolTip("Mosaic mixing is supported by the YOLO adapter. RT-DETR uses its own built-in data pipeline.")
+        af.addRow(self.mosaic_aug)
+        self.config_preview_btn = QPushButton("Preview training configuration"); self.config_preview_btn.clicked.connect(self.preview_training_config)
+        af.addRow(self.config_preview_btn)
+        af.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        advanced.hide()
+        self.advanced_toggle.toggled.connect(lambda checked: (advanced.setVisible(checked),
+            self.advanced_toggle.setText("Hide advanced configuration ▾" if checked else "Show advanced configuration ▸")))
+        self.advanced_training_group = advanced
+        layout.addWidget(advanced)
+
         train_actions = QHBoxLayout()
-        self.train_btn = self._button("Train YOLO", self.train, primary=True)
+        self.train_btn = self._button("Train Model", self.train, primary=True)
         self.resume_btn = self._button("Resume from last.pt", lambda: self.train(resume=True))
         self.resume_btn.setEnabled(False)
         self.resume_btn.setToolTip("Continue this dataset’s last saved run from runs/train/weights/last.pt.")
         train_actions.addWidget(self.train_btn)
         train_actions.addWidget(self.resume_btn)
+        self.stop_train_btn = self._button("Stop at checkpoint", self.stop_training)
+        self.stop_train_btn.setEnabled(False)
+        train_actions.addWidget(self.stop_train_btn)
         layout.addLayout(train_actions)
         self.train_progress = QProgressBar()
         self.train_progress.setRange(0, 100)
@@ -767,6 +847,7 @@ class DrillAnnotationStudio(QMainWindow):
 
     def detect_hardware_ui(self):
         self.hw=detect_hardware()
+        self.training_manager.hardware_snapshot = {**self.hw, "gpus": [gpu.__dict__ for gpu in self.hw["gpus"]]}
         self.device_combo.clear()
         self.device_combo.addItem("Auto", "auto")
         self.device_combo.addItem("CPU", "cpu")
@@ -807,8 +888,16 @@ class DrillAnnotationStudio(QMainWindow):
         if not self.manager.info:
             QMessageBox.information(self, "No dataset open", "Open a dataset first to browse its files.")
             return
-        dialog = DatasetBrowserDialog(self.manager.info.root, self)
+        dialog = DatasetBrowserDialog(self.manager, self)
         dialog.exec()
+
+    def open_merge_studio(self):
+        from merge_studio import DatasetMergeDialog
+        DatasetMergeDialog(self).exec()
+
+    def open_fine_tuning_prep(self):
+        from fine_tuning import FineTuningPreparationDialog
+        FineTuningPreparationDialog(self).exec()
 
     def create_new(self):
         parent=QFileDialog.getExistingDirectory(self,"Choose Parent Folder")
@@ -829,6 +918,9 @@ class DrillAnnotationStudio(QMainWindow):
     def load_dataset(self, path, quiet=False, restore_classes=None):
         try:
             self.manager.open(path)
+            if hasattr(self, "experiment_panel"):
+                self.experiment_panel.import_legacy_root(self.manager.info.root / "runs")
+                self.experiment_panel.import_legacy_root(self._training_output_dir(self.manager.info.root))
             self.results_panel.set_dataset_root(self.manager.info.root)
             if not self.manager.classes:
                 ids=self.manager.detect_class_ids()
@@ -845,6 +937,7 @@ class DrillAnnotationStudio(QMainWindow):
                 elif not quiet:
                     QMessageBox.information(self,"No Classes Yet","No class names or labeled class IDs were found. Add classes before annotation/training.")
             self.dataset_label.setText(f"{self.manager.info.kind.upper()} | {self.manager.info.root}")
+            self.train_dataset_info.setText(f"Training dataset: {len(self.manager.image_records())} images · {len(self.manager.classes)} classes: {', '.join(self.manager.classes)}")
             self.canvas.set_class_names(self.manager.classes)
             self.refresh_class_combo()
             self.refresh_images()
@@ -1000,23 +1093,18 @@ class DrillAnnotationStudio(QMainWindow):
     def delete_class(self):
         row=self.class_combo.currentIndex()
         if row<0: return
-        if QMessageBox.question(self,"Delete Class","Delete this class and rewrite label IDs?",QMessageBox.Yes|QMessageBox.No)==QMessageBox.No: return
-        for label in self.manager._label_files():
-            try:
-                lines=[]
-                for line in label.read_text(encoding="utf-8").splitlines():
-                    p=line.split()
-                    if len(p)!=5: continue
-                    cid=int(p[0])
-                    if cid==row: continue
-                    if cid>row: cid-=1
-                    lines.append(" ".join([str(cid)]+p[1:]))
-                label.write_text("\n".join(lines)+("\n" if lines else ""),encoding="utf-8")
-            except Exception as exc:
-                QMessageBox.warning(self,"Label Error",f"{label}\n{exc}")
-        classes=self.manager.classes[:row]+self.manager.classes[row+1:]
-        self.manager.set_classes(classes); self.refresh_class_combo()
-        if self.current_image: self.canvas.set_boxes(self.load_labels(self.current_image))
+        self.show_class_manager()
+
+    def show_class_manager(self):
+        if not self.manager.info:
+            QMessageBox.information(self, "No dataset open", "Open a dataset before managing classes.")
+            return
+        dialog = ClassManagerDialog(self.manager, self)
+        dialog.exec()
+        self.refresh_class_combo()
+        self.refresh_images()
+        if self.current_image and self.current_image.exists():
+            self.canvas.set_boxes(self.load_labels(self.current_image))
         self.schedule_session_save()
 
     def previous_image(self):
@@ -1044,9 +1132,93 @@ class DrillAnnotationStudio(QMainWindow):
             QMessageBox.critical(self,"Preparation Failed",str(exc))
 
     def refresh_model_names(self):
-        family=self.family_combo.currentText()
+        architecture = self.architecture_combo.currentText()
         self.model_combo.clear()
-        self.model_combo.addItems(MODEL_PRESETS.get(family, []))
+        is_yolo = architecture == "YOLO"
+        family_label = self.family_combo.parentWidget().layout().labelForField(self.family_combo)
+        if family_label: family_label.setVisible(is_yolo)
+        self.family_combo.setVisible(is_yolo)
+        self.model_combo.addItems(MODEL_PRESETS.get(self.family_combo.currentText(), []) if is_yolo else RTDETR_MODEL_PRESETS)
+        self.train_btn.setText("Train YOLO" if is_yolo else "Train RT-DETR")
+        self.resume_btn.setText("Resume YOLO checkpoint" if is_yolo else "Resume RT-DETR checkpoint")
+        self.precision_combo.setEnabled(is_yolo)
+        if not is_yolo:
+            self.precision_combo.setCurrentIndex(self.precision_combo.findData("fp32"))
+            self.freeze_spin.setEnabled(False)
+            self.mosaic_aug.setEnabled(False)
+        elif self.precision_combo.currentData() == "fp32":
+            self.precision_combo.setCurrentIndex(self.precision_combo.findData("auto"))
+            self.freeze_spin.setEnabled(True)
+            self.mosaic_aug.setEnabled(True)
+        else:
+            self.freeze_spin.setEnabled(True)
+            self.mosaic_aug.setEnabled(True)
+        self._update_resume_checkpoint(self.manager.info.root if self.manager.info else None)
+
+    def browse_training_output(self):
+        current = self.output_directory_edit.text().strip()
+        folder = QFileDialog.getExistingDirectory(self, "Choose training output directory", current)
+        if folder:
+            self.output_directory_edit.setText(folder)
+            self._update_resume_checkpoint(self.manager.info.root if self.manager.info else None)
+
+    def _training_output_dir(self, dataset_root=None):
+        custom = self.output_directory_edit.text().strip() if hasattr(self, "output_directory_edit") else ""
+        if custom:
+            return Path(custom).expanduser()
+        root = Path(dataset_root) if dataset_root else (self.manager.info.root if self.manager.info else Path.cwd())
+        run_root = root / "runs"
+        if getattr(self, "architecture_combo", None) and self.architecture_combo.currentText() == "RT-DETR":
+            run_root = run_root / "rtdetr"
+        return run_root
+
+    def _training_config(self, resume=False):
+        if not self.manager.info:
+            raise ValueError("Open a training dataset first.")
+        data_yaml = self.manager.info.root / "data.yaml"
+        if not data_yaml.is_file():
+            raise ValueError("Prepare or open a dataset with data.yaml before training.")
+        architecture = self.architecture_combo.currentText()
+        experiment = self.experiment_name.text().strip() or "train"
+        output = self._training_output_dir(self.manager.info.root)
+        model = self.selected_model()
+        version = self.family_combo.currentText() if architecture == "YOLO" else Path(model).stem
+        checkpoint = output / experiment / "weights" / "last.pt"
+        if resume:
+            if not checkpoint.is_file():
+                raise ValueError(f"No saved checkpoint exists at:\n{checkpoint}")
+            model = str(checkpoint)
+        return TrainingConfig(
+            architecture=architecture, model_version=version, initial_weights=model,
+            dataset_yaml=str(data_yaml), output_directory=str(output), experiment_name=experiment,
+            device=str(self.device_combo.currentData() or "auto"), epochs=self.epochs.value(),
+            batch_size=self.batch.value(), image_size=self.imgsz.value(),
+            learning_rate=self.learning_rate.value(), optimizer=self.optimizer_combo.currentText(),
+            weight_decay=self.weight_decay.value(), scheduler=str(self.scheduler_combo.currentData()),
+            validate_each_epoch=self.validate_each_epoch.isChecked(),
+            mosaic=(1.0 if self.mosaic_aug.isChecked() else 0.0) if architecture == "YOLO" else None,
+            workers=self.workers_spin.value(), patience=self.patience_spin.value() or None,
+            save_period=self.save_period_spin.value(), precision=str(self.precision_combo.currentData()),
+            freeze=self.freeze_spin.value() if self.freeze_spin.value() >= 0 else None,
+            resume=resume,
+        )
+
+    def preview_training_config(self):
+        try:
+            config = self._training_config()
+            adapter_id = "ultralytics-yolo" if config.architecture == "YOLO" else "ultralytics-rtdetr"
+            adapter = self.training_manager.registry.get(adapter_id)
+            summary = {
+                "adapter": adapter.capabilities.adapter_id,
+                "architecture": adapter.capabilities.architecture,
+                "model_versions": list(adapter.capabilities.model_versions),
+                "supported_parameters": sorted(adapter.capabilities.supported_parameters),
+                "configuration": config.to_dict(),
+                "dataset_validation": "Runs in the background when training starts.",
+            }
+            QMessageBox.information(self, "Training configuration preview", json.dumps(summary, indent=2, default=list))
+        except Exception as exc:
+            QMessageBox.warning(self, "Configuration is not ready", str(exc))
 
     def browse_model(self):
         path,_=QFileDialog.getOpenFileName(self,"Select Model","", "Model files (*.pt *.yaml *.yml);;All files (*.*)")
@@ -1134,41 +1306,72 @@ class DrillAnnotationStudio(QMainWindow):
         self.video_annotator_window.activateWindow()
 
     def train(self, resume=False):
-        if not self.manager.info:
-            QMessageBox.warning(self,"No Dataset","Open a dataset first."); return
-        data_yaml=self.manager.info.root/"data.yaml"
-        if not data_yaml.is_file():
-            QMessageBox.warning(self,"No data.yaml","Prepare a YOLO dataset first and select its output folder.")
+        if self.compute_manager.mode == "Worker":
+            QMessageBox.information(self, "Local training unavailable", "Switch to Controller or Hybrid mode to schedule local training.")
             return
-        model=self.selected_model()
-        if not model:
-            QMessageBox.warning(self,"Model Required","Choose a model."); return
-        device=self.device_combo.currentData() or "auto"
-        # Put training runs beside the selected YOLO dataset, not inside the source.
-        run_root=data_yaml.parent/"runs"
-        checkpoint = run_root / "train" / "weights" / "last.pt"
-        if resume:
-            if not checkpoint.is_file():
-                QMessageBox.warning(self, "No resume checkpoint", f"No saved checkpoint exists at:\n{checkpoint}")
-                self.resume_btn.setEnabled(False)
-                return
-            model = str(checkpoint)
-        self.worker=TrainingWorker(model,data_yaml,device,self.epochs.value(),self.imgsz.value(),self.batch.value(),run_root,resume=resume)
+        try:
+            config = self._training_config(resume=resume)
+            adapter_id = "ultralytics-yolo" if config.architecture == "YOLO" else "ultralytics-rtdetr"
+            config.extra["_isolated_process"] = True
+            config.extra["_cpu_threads"] = self.compute_manager.resource_profile.cpu_threads_per_job
+        except Exception as exc:
+            QMessageBox.warning(self, "Training configuration invalid", str(exc)); return
         self.save_session()
-        self.train_btn.setEnabled(False)
-        self.resume_btn.setEnabled(False)
         self.training_dialog = self._operation_dialog("Training progress")
+        self.training_dialog.log.append("Submitting local training job to Compute Center…")
         self.training_dialog.show()
-        self.worker.message.connect(self._training_message)
-        self.worker.progress.connect(self._training_progress)
-        self.worker.epoch_progress.connect(self.update_training_progress)
-        self.worker.finished_ok.connect(self.training_finished)
-        self.worker.failed.connect(self.training_failed)
-        self.worker.finished.connect(self._training_thread_finished)
-        self.worker.start()
+        output_key = str((Path(config.output_directory).expanduser().resolve() / config.experiment_name).resolve()).casefold()
+
+        def launch(job):
+            manager = TrainingManager(parent=self)
+            manager.set_experiment_database(self.experiment_database)
+            manager.hardware_snapshot = {**self.hw, "gpus": [gpu.__dict__ for gpu in self.hw.get("gpus", [])]}
+            manager.lifecycle_changed.connect(self._training_lifecycle_changed)
+            worker = manager.start(adapter_id, config, autostart=False)
+            self.training_manager = manager; self.experiment_panel.manager = manager
+            self._training_managers[job["id"]] = (manager, worker)
+            self.compute_manager.scheduler.database.update_compute_job_experiment(job["id"], manager.metadata["experiment_id"])
+            worker.message.connect(self._training_message)
+            worker.progress.connect(self._training_progress)
+            worker.epoch_progress.connect(self.update_training_progress)
+            worker.finished_ok.connect(lambda path, m=manager, w=worker: self.training_finished(path, m, w))
+            worker.failed.connect(lambda error, m=manager, w=worker: self.training_failed(error, m, w))
+            worker.finished.connect(lambda m=manager, w=worker, jid=job["id"]: self._training_thread_finished(m, w, jid))
+            self.worker = worker
+            self.training_dialog.log.append(f"Job {job['id'][:8]} · Experiment {manager.metadata['experiment_id'][:8]} · {manager.state}")
+            self.training_dialog.log.append(f"Experiment metadata: {manager.metadata_path}")
+            return worker
+
+        try:
+            self.compute_manager.scheduler.submit(
+                architecture=config.architecture,
+                requirements={"device": config.device, "ram_mb": 0, "gpu_memory_mb": 0,
+                              "cpu_threads": self.compute_manager.resource_profile.cpu_threads_per_job,
+                              "minimum_free_disk_gb": self.compute_manager.resource_profile.minimum_free_disk_gb},
+                preferred_device=config.device, priority=self.compute_center.priority.value(), launcher=launch,
+                dedupe_key=output_key)
+            self.train_btn.setEnabled(True); self.resume_btn.setEnabled(True)
+            self.stop_train_btn.setEnabled(True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Training job not queued", str(exc))
+
+    def stop_training(self):
+        active = [(job_id, worker) for job_id, (_manager, worker) in self._training_managers.items() if worker.isRunning()]
+        if active:
+            _job_id, worker = active[-1]
+            worker.request_stop()
+            self.stop_train_btn.setEnabled(False)
+            self.status.setText("Stop requested; the training process will finish its current safe checkpoint boundary.")
+
+    def _training_lifecycle_changed(self, experiment_id, state):
+        self.status.setText(f"Training job {state}: {experiment_id[:8]}")
+        if hasattr(self, "training_dialog"):
+            self.training_dialog.log.append(f"Lifecycle: {state}")
 
     def _update_resume_checkpoint(self, dataset_root):
-        run_dir = Path(dataset_root) / "runs" / "train"
+        if not dataset_root:
+            self.resume_btn.setEnabled(False); return
+        run_dir = self._training_output_dir(dataset_root) / (self.experiment_name.text().strip() or "train")
         checkpoint = run_dir / "weights" / "last.pt"
         available = checkpoint.is_file()
         self.resume_btn.setEnabled(available)
@@ -1189,20 +1392,28 @@ class DrillAnnotationStudio(QMainWindow):
             self.train_progress.setValue(0)
             self.train_progress.setFormat("Training progress: %p%")
 
-    def training_finished(self,path):
+    def training_finished(self, path, manager=None, worker=None):
+        manager = manager or self.training_manager; worker = worker or self.worker
         self.results_panel.refresh_runs()
         if self.manager.info:
             self._update_resume_checkpoint(self.manager.info.root)
-        stopped = bool(self.worker and self.worker._stop_requested.is_set())
+        stopped = bool(worker and worker._stop_requested.is_set())
         self.train_progress.setValue(0 if stopped else 100)
-        self.status.setText(f"Training paused and checkpoint saved: {path}" if stopped else f"Training finished: {path}")
+        checkpoint_saved = bool(manager.metadata and Path(manager.metadata["checkpoints"]["last"]).is_file())
+        if stopped and checkpoint_saved:
+            self.status.setText(f"Training paused and checkpoint saved: {path}")
+        elif stopped:
+            self.status.setText("Training cancelled before a resumable checkpoint was created.")
+        else:
+            self.status.setText(f"Training finished: {path}")
         if hasattr(self, "training_dialog"):
-            self.training_dialog.log.append(f"\n{'Training paused' if stopped else 'Training finished'}: {path}")
+            self.training_dialog.log.append(f"\n{'Training paused' if stopped and checkpoint_saved else 'Training cancelled' if stopped else 'Training finished'}: {path}")
         if not (stopped and (self._reset_after_training or self._close_after_training)):
-            QMessageBox.information(self,"Training Paused" if stopped else "Training Complete",
-                                    f"{'Training stopped at a safe checkpoint. Resume with the Resume from last.pt button.' if stopped else 'Training finished.'}\n\n{path}")
+            QMessageBox.information(self,"Training Paused" if stopped and checkpoint_saved else "Training Cancelled" if stopped else "Training Complete",
+                                    f"{'Training stopped at a safe checkpoint. Resume with the resume button.' if stopped and checkpoint_saved else 'No resumable checkpoint was created.' if stopped else 'Training finished.'}\n\n{path}")
 
-    def training_failed(self,msg):
+    def training_failed(self, msg, manager=None, worker=None):
+        manager = manager or self.training_manager
         self.results_panel.refresh_runs()
         self.status.setText("Training failed.")
         if self.manager.info:
@@ -1233,14 +1444,23 @@ class DrillAnnotationStudio(QMainWindow):
         if hasattr(self, "training_dialog") and detail:
             self.training_dialog.log.append(f"Epoch {epoch}/{total} — {detail}")
 
-    def _training_thread_finished(self):
+    def _training_thread_finished(self, manager=None, worker=None, job_id=None):
+        manager = manager or self.training_manager
+        if job_id:
+            self._training_managers.pop(job_id, None)
+        remaining = [(jid, pair) for jid, pair in self._training_managers.items() if pair[1].isRunning()]
+        self.worker = remaining[-1][1][1] if remaining else None
         self.train_btn.setEnabled(True)
+        self.stop_train_btn.setEnabled(bool(remaining))
         if self.manager.info:
             self._update_resume_checkpoint(self.manager.info.root)
-        if self._reset_after_training:
+        if manager and manager.metadata:
+            self.results_panel.add_run_root(Path(manager.metadata["training_configuration"]["output_directory"]))
+        self.compute_center.refresh_jobs()
+        if self._reset_after_training and not remaining:
             self._reset_after_training = False
             QTimer.singleShot(0, self._perform_reset)
-        elif self._close_after_training:
+        elif self._close_after_training and not remaining:
             self._close_after_training = False
             QTimer.singleShot(0, self.close)
 
@@ -1263,11 +1483,20 @@ class DrillAnnotationStudio(QMainWindow):
                                   for box in self.canvas.boxes] if self.current_image and self.unsaved and include_unsaved else None),
             "workspace_tab": self.workspace_tabs.currentIndex(),
             "training": {
+                "architecture": self.architecture_combo.currentText(),
                 "family": self.family_combo.currentText(),
                 "preset": self.model_combo.currentText(),
                 "model_path": self.model_path.text(),
                 "device": self.device_combo.currentData(),
                 "epochs": self.epochs.value(), "imgsz": self.imgsz.value(), "batch": self.batch.value(),
+                "experiment": self.experiment_name.text(), "output_directory": self.output_directory_edit.text(),
+                "learning_rate": self.learning_rate.value(), "weight_decay": self.weight_decay.value(),
+                "optimizer": self.optimizer_combo.currentText(), "scheduler": self.scheduler_combo.currentData(),
+                "validate_each_epoch": self.validate_each_epoch.isChecked(),
+                "mosaic": self.mosaic_aug.isChecked(),
+                "workers": self.workers_spin.value(), "patience": self.patience_spin.value(),
+                "save_period": self.save_period_spin.value(), "precision": self.precision_combo.currentData(),
+                "freeze": self.freeze_spin.value(),
             },
             "inference": inference,
         }
@@ -1286,6 +1515,9 @@ class DrillAnnotationStudio(QMainWindow):
         try:
             training = state.get("training", {})
             self._cuda_install_pending = bool(state.get("cuda_install_pending", False))
+            architecture = training.get("architecture")
+            if architecture and self.architecture_combo.findText(architecture) >= 0:
+                self.architecture_combo.setCurrentText(architecture)
             family = training.get("family")
             if family and self.family_combo.findText(family) >= 0:
                 self.family_combo.setCurrentText(family)
@@ -1296,6 +1528,22 @@ class DrillAnnotationStudio(QMainWindow):
             self.epochs.setValue(int(training.get("epochs", 100)))
             self.imgsz.setValue(int(training.get("imgsz", 640)))
             self.batch.setValue(int(training.get("batch", 16)))
+            self.experiment_name.setText(training.get("experiment", "train"))
+            self.output_directory_edit.setText(training.get("output_directory", ""))
+            self.learning_rate.setValue(float(training.get("learning_rate", 0.01)))
+            self.weight_decay.setValue(float(training.get("weight_decay", 0.0005)))
+            optimizer_index = self.optimizer_combo.findText(training.get("optimizer", "auto"))
+            if optimizer_index >= 0: self.optimizer_combo.setCurrentIndex(optimizer_index)
+            scheduler_index = self.scheduler_combo.findData(training.get("scheduler", "default"))
+            if scheduler_index >= 0: self.scheduler_combo.setCurrentIndex(scheduler_index)
+            self.validate_each_epoch.setChecked(bool(training.get("validate_each_epoch", True)))
+            self.mosaic_aug.setChecked(bool(training.get("mosaic", True)))
+            self.workers_spin.setValue(int(training.get("workers", 0)))
+            self.patience_spin.setValue(int(training.get("patience", 100)))
+            self.save_period_spin.setValue(int(training.get("save_period", -1)))
+            precision_index = self.precision_combo.findData(training.get("precision", "auto"))
+            if precision_index >= 0: self.precision_combo.setCurrentIndex(precision_index)
+            self.freeze_spin.setValue(int(training.get("freeze", -1)))
             device_index = self.device_combo.findData(training.get("device"))
             if device_index >= 0:
                 self.device_combo.setCurrentIndex(device_index)
@@ -1335,11 +1583,14 @@ class DrillAnnotationStudio(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        if self.worker and self.worker.isRunning():
+        for job in self.experiment_database.list_compute_jobs():
+            if job["state"] == "queued": self.compute_manager.scheduler.cancel(job["id"])
+        active_workers = [worker for _manager, worker in self._training_managers.values() if worker.isRunning()]
+        if active_workers:
             self._reset_after_training = True
             self.reset_button.setEnabled(False)
             self.status.setText("Reset is waiting for training to stop safely and save its last checkpoint…")
-            self.worker.request_stop()
+            for worker in active_workers: worker.request_stop()
             return
         self._perform_reset()
 
@@ -1364,8 +1615,22 @@ class DrillAnnotationStudio(QMainWindow):
         self.unsaved = False
         self.refresh_class_combo()
         self.family_combo.setCurrentIndex(0)
+        self.architecture_combo.setCurrentIndex(0)
         self.refresh_model_names()
         self.model_path.clear()
+        self.experiment_name.setText("train")
+        self.output_directory_edit.clear()
+        self.learning_rate.setValue(0.01)
+        self.weight_decay.setValue(0.0005)
+        self.optimizer_combo.setCurrentIndex(0)
+        self.scheduler_combo.setCurrentIndex(0)
+        self.workers_spin.setValue(0)
+        self.patience_spin.setValue(100)
+        self.save_period_spin.setValue(-1)
+        self.precision_combo.setCurrentIndex(0)
+        self.freeze_spin.setValue(-1)
+        self.validate_each_epoch.setChecked(True)
+        self.mosaic_aug.setChecked(True)
         self.epochs.setValue(100)
         self.imgsz.setValue(640)
         self.batch.setValue(16)
@@ -1406,23 +1671,29 @@ class DrillAnnotationStudio(QMainWindow):
             if ans==QMessageBox.Discard:
                 self.unsaved = False
                 self.save_session(include_unsaved=False)
-        if self.worker and self.worker.isRunning():
+        active_workers = [(job_id, manager, worker) for job_id, (manager, worker) in self._training_managers.items() if worker.isRunning()]
+        queued_jobs = [job for job in self.experiment_database.list_compute_jobs() if job["state"] == "queued"]
+        if active_workers or queued_jobs:
             ans=QMessageBox.question(
                 self, "Training in progress",
-                "Stop training safely at the next epoch boundary, save last.pt, and close? You can resume from last.pt next time.",
+                f"Stop {len(active_workers)} active training job(s) safely at their next checkpoint boundary and cancel {len(queued_jobs)} queued job(s)? Active jobs will remain resumable where supported.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if ans != QMessageBox.Yes:
                 event.ignore(); return
             self.save_session()
             self._close_after_training = True
-            self.status.setText("Training will stop at a safe checkpoint before the studio closes…")
-            self.worker.request_stop()
-            event.ignore()
-            return
+            self.status.setText("Training jobs are stopping safely before the studio closes…")
+            for job in queued_jobs:
+                self.compute_manager.scheduler.cancel(job["id"])
+            for _job_id, _manager, worker in active_workers: worker.request_stop()
+            if active_workers:
+                event.ignore(); return
+            self._close_after_training = False
         self._stop_cuda_install_for_close()
         self.save_session()
         self.inference_panel.stop_and_wait()
+        self.compute_center.stop(); self.compute_manager.close()
         event.accept()
 
 def main():
