@@ -14,17 +14,17 @@ This guide describes the current **Compute Center** controls for connecting a co
 
 1. Open **Compute Center** in Dataset Studio.
 2. Set **Operating mode** to **Controller** or **Hybrid**, then click **Apply operating mode**.
-3. In **Worker Manager**, enter the controller **Bind address** and **Port**. Use a network interface reachable by the worker; the default bind address is `0.0.0.0`.
-4. Browse to the controller’s TLS **Certificate** and **Private key** files. Keep the key private.
-5. Click **Start secure controller**. If it fails, check the certificate/key pair, port availability, and firewall rules. The worker must trust the certificate name it connects to.
-6. Click **Create one-time enrollment token…**. Send the short-lived token privately to one trusted worker operator. The token is one-use and is not saved in plaintext.
+3. In **Worker Manager**, enter the controller **Bind address** and **Port**. Select a LAN address reachable by the worker; the default is `127.0.0.1` (local computer only).
+4. Click **Set up or reuse controller certificates…**. The application creates/reuses a local CA and SAN certificate; no OpenSSL commands are needed. Private keys are protected with Windows DPAPI. **Renew controller certificate…** rotates the leaf certificate; **Rotate CA…** rotates trust and requires re-enrollment.
+5. Click **Start secure controller**. If it fails, check certificate validity, port availability, and firewall rules.
+6. Click **Create one-time enrollment token…**. The dialog supports copy/show, expiry countdown, consumed status, revocation, and generating another token. Click **Export worker package…** to export endpoint, public CA, one-time token and expiry. Share it only over a trusted private channel; it contains no private keys.
 
 ## Configure and approve a worker
 
 1. On the second computer, open **Compute Center** and set **Operating mode** to **Worker** or **Hybrid**.
 2. Enter a recognizable **Worker name**. Keep the generated **Persistent worker ID** unless you are deliberately enrolling a new identity.
-3. Enter the controller computer’s network name/IP in **Controller host**, the same **Port**, and select the controller CA/certificate in **Controller trust certificate**. For a certificate issued by a CA already trusted by the operating system, the trust file may be left blank.
-4. Paste the enrollment token in **Enrollment token**, then click **Connect worker securely**. The worker connects outward using TLS and reports hardware/software information.
+3. Click **Join existing Controller…** and import the enrollment package. It installs only the public CA certificate and fills host, port, token, and expiry.
+4. Click **Connect worker securely**. The worker connects outward using TLS 1.2 or newer, verifies the controller hostname and CA, and reports hardware/software information.
 5. On the controller, refresh **Worker Manager**. Select the new row and click **Approve selected**. The row should say **Online**, **Approved**, and **Enabled**. Review the architecture, PyTorch/Ultralytics versions, free RAM/disk, and GPU/VRAM fields.
 6. If the worker stays pending or offline, confirm the controller is running, the host/port resolve correctly, the certificate name matches the host, firewall access is allowed, and both clocks are reasonably accurate.
 
@@ -32,7 +32,7 @@ This guide describes the current **Compute Center** controls for connecting a co
 
 Use **Guided remote training…** in the **Job Queue** tab. It uses the currently open prepared dataset and the current selections in the main **Train** panel. The guide shows online approved workers and a reason when a worker is unsuitable.
 
-The controller checks approval/enablement, online status, the worker’s reported architecture list, requested CPU/GPU device, available RAM and disk when reported, PyTorch/Ultralytics version presence, and whether a remote job is already active. Automatic assignment chooses the first compatible worker that polls. A specific worker can be pinned. The current version does not guarantee an exact PyTorch/CUDA/Ultralytics version match; verify these runtime versions when controller and worker environments differ.
+The controller checks approval/enablement, heartbeat freshness, architecture, requested CPU/GPU device, RAM/VRAM/disk, runtime version presence, and active resource reservations. Compatibility details show reported free memory, reservations, requested memory, and safety margin. A worker can be connected and approved yet unsuitable for a particular job. Exact framework/CUDA version matching is not guaranteed; inspect reported versions when environments differ.
 
 ## Submit a remote experiment
 
@@ -60,7 +60,7 @@ To clear cached dataset versions, first stop active remote work, then click **Cl
 
 ## Disconnection and restart recovery
 
-- If only the network drops while the worker application and training process remain running, training can continue locally. The worker reconnects with a fixed five-second wait and retries queued status/transfer requests. Each individual request has a bounded wait; a long outage can fail the remote job. The controller does not assign an already-reserved job to another worker.
+- If only the network drops while the worker application and training process remain running, training can continue locally. The worker reconnects using bounded exponential backoff with jitter. Each request has a bounded wait; a long outage can fail the remote job. The controller does not assign an already-reserved job to another worker.
 - Check the worker’s local output folder and Compute Center before submitting another job. Do not submit a duplicate while the original process may still be training.
 - If the worker application restarts, its cache and checkpoints remain on disk, but this version does not persist and reconcile an active worker process automatically. If the controller application restarts, an active job is recorded as interrupted/failed and is not automatically retried.
 - If the last status is unclear, reconnect the worker, request cancellation from the controller when possible, confirm the worker process has stopped, and then decide whether to resume from a known `last.pt` or submit a new experiment. A worker-side unfinished checkpoint may need to be copied back manually if the transfer did not complete.
@@ -82,3 +82,7 @@ To clear cached dataset versions, first stop active remote work, then click **Cl
 ## Verification status
 
 Automated tests cover the mocked TLS protocol, remote YOLO and RT-DETR adapter paths, dataset/archive hashes and cache, progress, cancellation records, and artifact receipt. This development environment has one computer, so it has **not** completed the physical two-computer acceptance sequence. GPU remote execution is also untested here.
+
+## Job history and security events
+
+Job Queue provides **Archive selected**, **Delete selected**, **Clear terminal jobs**, and **Inspect job / logs**. Active jobs cannot be archived or deleted. A remote record remains protected until the worker confirms terminal state. Removing a job preserves its experiment record and files. Worker Manager displays audit events for enrollment, authentication, approval/revocation, assignment, cancellation, dataset transfer, and artifact retrieval. Enrollment tokens are single-use, expiring, revocable, and stored only as hashes in SQLite.

@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 import os
+import random
 import secrets
 import socket
 import ssl
@@ -70,15 +71,16 @@ class DPAPICredentialStore:
         _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
     @classmethod
-    def _crypt(cls, data: bytes, protect: bool):
+    def _crypt(cls, data: bytes, protect: bool, entropy_value: bytes | None = None):
         if os.name != "nt":
             raise RuntimeError("Secure worker credential storage is available only through Windows DPAPI on this platform.")
         crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         input_buffer = ctypes.create_string_buffer(data)
-        entropy_buffer = ctypes.create_string_buffer(cls.ENTROPY)
+        entropy_value = entropy_value or cls.ENTROPY
+        entropy_buffer = ctypes.create_string_buffer(entropy_value)
         source = cls._Blob(len(data), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_ubyte)))
-        entropy = cls._Blob(len(cls.ENTROPY), ctypes.cast(entropy_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+        entropy = cls._Blob(len(entropy_value), ctypes.cast(entropy_buffer, ctypes.POINTER(ctypes.c_ubyte)))
         output = cls._Blob()
         if protect:
             ok = crypt32.CryptProtectData(ctypes.byref(source), "Dataset Studio", ctypes.byref(entropy), None, None, 0, ctypes.byref(output))
@@ -308,6 +310,19 @@ class ComputeControllerServer(threading.Thread):
         self.remote_handler = remote_handler
         self.command_provider = command_provider
         self._stop_event = threading.Event(); self._listener = None; self._client_sockets = set(); self._lock = threading.Lock()
+        self._ip_attempts = {}; self._max_connections_per_minute = 12; self._max_concurrent_clients = 32
+
+    def _allow_connection(self, address):
+        now = time.monotonic(); host = str(address[0])
+        with self._lock:
+            if len(self._client_sockets) >= self._max_concurrent_clients:
+                return False
+            attempts = [stamp for stamp in self._ip_attempts.get(host, []) if now - stamp < 60]
+            if len(attempts) >= self._max_connections_per_minute:
+                self._ip_attempts[host] = attempts
+                return False
+            attempts.append(now); self._ip_attempts[host] = attempts
+            return True
 
     @staticmethod
     def _read(stream):
@@ -339,6 +354,12 @@ class ComputeControllerServer(threading.Thread):
                 except OSError:
                     if self._stop_event.is_set(): break
                     raise
+                client.settimeout(10)
+                if not self._allow_connection(address):
+                    try: client.close()
+                    except OSError: pass
+                    self.database.record_security_event("connection_rate_limited", "network_peer", address[0])
+                    continue
                 with self._lock: self._client_sockets.add(client)
                 threading.Thread(target=self._serve_client, args=(client, address, context), daemon=True).start()
         except Exception as exc:
@@ -352,6 +373,7 @@ class ComputeControllerServer(threading.Thread):
         worker_id = connection_id = None
         try:
             with context.wrap_socket(raw_socket, server_side=True) as connection:
+                connection.settimeout(30)
                 with connection.makefile("rwb") as stream:
                     hello = self._read(stream)
                     kind = hello.get("type")
@@ -366,14 +388,22 @@ class ComputeControllerServer(threading.Thread):
                         self.database.enroll_worker(_worker_secret_hash(token), worker_id, name,
                             f"{address[0]}:{address[1]}", credential, hello.get("hardware", {}), hello.get("software", {}))
                         connection_id = uuid.uuid4().hex
+                        if not self.database.record_worker_heartbeat(worker_id, connection_id,
+                                hello.get("hardware", {}), hello.get("software", {})):
+                            raise PermissionError("Worker session could not be established.")
                         self._send(stream, {"type": "enrolled", "worker_id": worker_id, "credential": credential, "approved": False})
                     elif kind == "authenticate":
                         worker_id = str(hello.get("worker_id", "")); credential = hello.get("credential", "")
+                        self.database.expire_stale_workers()
                         worker = self.database.authenticate_worker(worker_id, credential if isinstance(credential, str) else "")
                         if worker is None or not worker["enabled"]: raise PermissionError("Worker authentication failed or this worker is disabled/revoked.")
                         connection_id = uuid.uuid4().hex
-                        self.database.record_worker_heartbeat(worker_id, connection_id, hello.get("hardware", {}), hello.get("software", {}))
+                        if not self.database.record_worker_heartbeat(worker_id, connection_id,
+                                hello.get("hardware", {}), hello.get("software", {})):
+                            raise PermissionError("Worker already has an active connection or was disabled/revoked.")
                         worker = self.database.get_worker(worker_id)
+                        self.database.record_security_event("worker_authenticated", "worker", worker_id,
+                            {"peer_ip": address[0], "approved": bool(worker["approved"])})
                         self._send(stream, {"type": "authenticated", "worker_id": worker_id, "approved": bool(worker["approved"])})
                     else:
                         raise PermissionError("Unknown worker connection type.")
@@ -413,6 +443,12 @@ class ComputeControllerServer(threading.Thread):
                         self._send(stream, reply)
                         if self.heartbeat_event: self.heartbeat_event(worker_id)
         except Exception as exc:
+            if worker_id:
+                try:
+                    self.database.record_security_event("worker_authentication_rejected", "worker", worker_id,
+                        {"peer_ip": address[0], "reason": type(exc).__name__})
+                except Exception:
+                    pass
             if self.error_event and not self._stop_event.is_set(): self.error_event(str(exc))
         finally:
             if worker_id and connection_id: self.database.disconnect_worker(worker_id, connection_id)
@@ -434,14 +470,16 @@ class ComputeControllerServer(threading.Thread):
 class ComputeWorkerClient(threading.Thread):
     """Outbound TLS worker channel with optional application-owned remote messages."""
     def __init__(self, *, worker_id, name, host, port, ca_file, database, credential_store,
-                 enrollment_token=None, heartbeat_seconds=3, events: ComputeEvents | None = None):
+                 enrollment_token=None, enrollment_expires_at=None, heartbeat_seconds=3, events: ComputeEvents | None = None):
         super().__init__(name="dataset-studio-worker-client", daemon=True)
         self.worker_id, self.name = worker_id, name
         self.host, self.port, self.ca_file = host, int(port), ca_file or None
         self.database, self.credential_store, self.enrollment_token = database, credential_store, enrollment_token
+        self.enrollment_expires_at = enrollment_expires_at
         self.heartbeat_seconds, self.events = max(2, int(heartbeat_seconds)), events
         self._stop_event = threading.Event(); self._wake_event = threading.Event(); self._socket = None
         self._remote_lock = threading.Lock(); self._remote_outbox = []
+        self.retry_attempt = 0
 
     def send_remote_message(self, message: dict):
         """Queue a small structured status event for the next authenticated heartbeat."""
@@ -492,6 +530,12 @@ class ComputeWorkerClient(threading.Thread):
             return
         while not self._stop_event.is_set():
             try:
+                if credential is None and self.enrollment_token and self.enrollment_expires_at:
+                    expires = datetime.fromisoformat(str(self.enrollment_expires_at).replace("Z", "+00:00"))
+                    if expires <= utc_now():
+                        self.enrollment_token = None
+                        if self.events: self.events.error.emit("Enrollment token expired; import a new enrollment package or enter a current token.")
+                        return
                 context = ssl.create_default_context(cafile=self.ca_file)
                 context.minimum_version = ssl.TLSVersion.TLSv1_2
                 sock = socket.create_connection((self.host, self.port), timeout=8)
@@ -514,6 +558,7 @@ class ComputeWorkerClient(threading.Thread):
                                             "hardware": snapshot, "software": versions})
                         response = self._receive(stream)
                         if response.get("type") != "authenticated": raise PermissionError("Controller authentication failed.")
+                    self.retry_attempt = 0
                     if self.events: self.events.connected.emit("approved" if response.get("approved") else "pending approval")
                     while not self._stop_event.is_set():
                         snapshot = detect_hardware(); snapshot["gpus"] = [gpu.__dict__ for gpu in snapshot["gpus"]]
@@ -536,7 +581,9 @@ class ComputeWorkerClient(threading.Thread):
                     except OSError: pass
             except Exception as exc:
                 if self.events and not self._stop_event.is_set(): self.events.error.emit(str(exc))
-                self._stop_event.wait(5)
+                delay = min(60.0, 2 ** min(self.retry_attempt, 6)) * random.uniform(.8, 1.2)
+                self.retry_attempt = min(self.retry_attempt + 1, 10)
+                self._stop_event.wait(delay)
             finally:
                 if self._socket:
                     try: self._socket.close()
@@ -567,6 +614,7 @@ class UnifiedComputeManager(QObject):
         self.events = ComputeEvents()
         self.controller = None; self.worker_client = None
         self.remote_broker = None; self.remote_agent = None
+        self._controller_key_context = None
 
     def save_settings(self, settings: dict, profile: ResourceProfile | None = None):
         next_mode = settings.get("mode", self.mode)
@@ -586,30 +634,57 @@ class UnifiedComputeManager(QObject):
         if self.mode not in ("Controller", "Hybrid"): raise RuntimeError("Controller capabilities are not enabled in the selected mode.")
         token = secrets.token_urlsafe(32); expires = (utc_now() + timedelta(minutes=max(1, min(int(lifetime_minutes), 1440)))).isoformat()
         self.database.add_enrollment_token(_worker_secret_hash(token), expires)
+        self.database.record_security_event("enrollment_token_created", "enrollment_token",
+            _worker_secret_hash(token).hex()[:12], {"expires_at": expires})
         return token, expires
 
     def start_controller(self):
         if self.mode not in ("Controller", "Hybrid"): raise RuntimeError("Switch to Controller or Hybrid mode first.")
         if self.controller and self.controller.is_alive(): return
-        host = str(self.settings.get("listen_host", "0.0.0.0")); port = int(self.settings.get("listen_port", 8765))
+        host = str(self.settings.get("listen_host", "127.0.0.1")); port = int(self.settings.get("listen_port", 8765))
         cert, key = self.settings.get("tls_cert", ""), self.settings.get("tls_key", "")
         if not cert or not key: raise ValueError("Select a TLS certificate and private key before starting the controller service.")
+        runtime_key = key
+        key_path = Path(key)
+        key_context = None
+        ca_path = self.settings.get("tls_ca", "")
+        if not ca_path:
+            raise ValueError("Select the controller CA certificate before starting TLS. Certificate trust is required.")
+        from compute_security import ControllerCertificateManager
+        certificate_manager = ControllerCertificateManager(key_path.parent)
+        if key_path.suffix.lower() == ".dpapi":
+            certificate_manager.validate(ca_path, cert, key_path)
+            key_context = certificate_manager.runtime_private_key(key_path)
+            runtime_key = str(key_context.__enter__())
+        else:
+            certificate_manager.validate(ca_path, cert, key_path, key_is_encrypted=False)
         from distributed_training import RemoteJobBroker
         self.remote_broker = RemoteJobBroker(self.database, app_state_file("remote_dataset_transfers"))
-        self.controller = ComputeControllerServer(self.database, host, port, cert, key,
-            lambda worker_id: self.events.worker_changed.emit(worker_id), lambda error: self.events.error.emit(error),
-            remote_handler=self.remote_broker.handle, command_provider=self.remote_broker.offer_next)
-        self.controller.start()
+        try:
+            self.controller = ComputeControllerServer(self.database, host, port, cert, runtime_key,
+                lambda worker_id: self.events.worker_changed.emit(worker_id), lambda error: self.events.error.emit(error),
+                remote_handler=self.remote_broker.handle, command_provider=self.remote_broker.offer_next)
+            self._controller_key_context = key_context
+            self.controller.start()
+            self.database.record_security_event("controller_listener_started", "controller", f"{host}:{port}")
+        except Exception:
+            if key_context: key_context.__exit__(None, None, None)
+            self._controller_key_context = None
+            self.controller = None
+            raise
 
     def submit_remote_job(self, config, dataset_dir, *, worker_id=None, priority=0, experiment_id=None,
-                          ram_mb=0, minimum_free_disk_gb=0):
+                          ram_mb=0, gpu_memory_mb=0, minimum_free_disk_gb=0):
         if self.mode not in ("Controller", "Hybrid"):
             raise RuntimeError("Remote job submission is available in Controller or Hybrid mode.")
         from distributed_training import RemoteJobBroker
         if self.remote_broker is None:
             self.remote_broker = RemoteJobBroker(self.database, app_state_file("remote_dataset_transfers"))
         return self.remote_broker.submit(config, dataset_dir, worker_id=worker_id, priority=priority,
-            experiment_id=experiment_id, ram_mb=ram_mb, minimum_free_disk_gb=minimum_free_disk_gb)
+            experiment_id=experiment_id, ram_mb=ram_mb, gpu_memory_mb=gpu_memory_mb,
+            minimum_free_disk_gb=minimum_free_disk_gb,
+            ram_safety_percent=self.resource_profile.ram_safety_percent,
+            gpu_memory_safety_mb=self.resource_profile.gpu_memory_safety_mb)
 
     def cancel_remote_job(self, job_id: str):
         result = self.database.request_remote_job_cancel(job_id)
@@ -623,13 +698,21 @@ class UnifiedComputeManager(QObject):
         return result
 
     def stop_controller(self):
-        if self.controller: self.controller.stop(); self.controller = None
+        if self.controller:
+            controller = self.controller; controller.stop()
+            controller.join(timeout=5)
+            self.controller = None
+            self.database.record_security_event("controller_listener_stopped", "controller")
+        if self._controller_key_context:
+            self._controller_key_context.__exit__(None, None, None)
+            self._controller_key_context = None
 
-    def start_worker(self, *, worker_id, name, host, port, ca_file="", enrollment_token=None):
+    def start_worker(self, *, worker_id, name, host, port, ca_file="", enrollment_token=None, enrollment_expires_at=None):
         if self.mode not in ("Worker", "Hybrid"): raise RuntimeError("Switch to Worker or Hybrid mode first.")
         self.stop_worker()
         self.worker_client = ComputeWorkerClient(worker_id=worker_id, name=name, host=host, port=port, ca_file=ca_file,
-            database=self.database, credential_store=self.credential_store, enrollment_token=enrollment_token, events=self.events)
+            database=self.database, credential_store=self.credential_store, enrollment_token=enrollment_token,
+            enrollment_expires_at=enrollment_expires_at, events=self.events)
         from distributed_training import RemoteWorkerAgent
         self.remote_agent = RemoteWorkerAgent(self.worker_client, self.events,
             cache_root=app_state_file("worker_dataset_cache"), output_root=app_state_file("remote_training_runs"))

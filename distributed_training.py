@@ -19,6 +19,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -27,6 +28,8 @@ from training_framework import TrainingConfig
 
 
 CHUNK_BYTES = 1024 * 1024
+MAX_DATASET_ARCHIVE_BYTES = 128 * 1024 ** 3
+MAX_REMOTE_ARTIFACT_BYTES = 64 * 1024 ** 3
 SUPPORTED_ARCHITECTURES = {"YOLO": "ultralytics-yolo", "RT-DETR": "ultralytics-rtdetr"}
 _SAFE_CONFIG_FIELDS = {"architecture", "model_version", "initial_weights", "dataset_yaml",
     "output_directory", "experiment_name", "device", "epochs", "batch_size", "image_size",
@@ -201,6 +204,13 @@ class DatasetCache:
         if target.exists():
             raise ValueError("The worker cache entry exists but failed integrity checks. Clear that cache entry before retrying.")
         archive = Path(archive_path)
+        archive_size = archive.stat().st_size if archive.is_file() else 0
+        if archive_size > MAX_DATASET_ARCHIVE_BYTES or int(manifest.get("archive_size", archive_size)) > MAX_DATASET_ARCHIVE_BYTES:
+            raise ValueError("Dataset archive exceeds the 128 GB transfer limit.")
+        capacity_ok, capacity_reason = self.check_capacity(archive_size + int(manifest.get("total_bytes", 0)),
+                                                           safety_bytes=1024 ** 3)
+        if not capacity_ok:
+            raise OSError(capacity_reason)
         if manifest.get("archive_sha256") and _sha256_file(archive) != manifest["archive_sha256"]:
             raise ValueError("Dataset archive hash does not match the controller manifest.")
         expected = {row["path"]: row for row in manifest.get("files", [])}
@@ -310,15 +320,19 @@ class RemoteJobBroker:
         self.database = database
         self.archive_root = Path(archive_root).expanduser().resolve()
         self.archive_root.mkdir(parents=True, exist_ok=True)
+        self._transfer_events = set(); self._transfer_lock = threading.Lock()
 
     def submit(self, config: TrainingConfig | dict, dataset_dir: str | Path, *, worker_id: str | None = None,
                priority: int = 0, experiment_id: str | None = None, ram_mb: int = 0,
-               minimum_free_disk_gb: float = 0) -> str:
+               minimum_free_disk_gb: float = 0, gpu_memory_mb: int = 0,
+               ram_safety_percent: int = 20, gpu_memory_safety_mb: int = 2048) -> str:
         cfg = config.to_dict() if isinstance(config, TrainingConfig) else dict(config)
         cfg["device"] = cfg.get("device", "auto")
         config_obj = validate_job_spec({"config": cfg}, trusted_submission=True)
         dataset_root = Path(dataset_dir).expanduser().resolve()
         manifest = dataset_manifest(dataset_root)
+        if int(manifest["total_bytes"]) > MAX_DATASET_ARCHIVE_BYTES:
+            raise ValueError("Dataset exceeds the configured remote archive size limit.")
         configured_yaml = Path(config_obj.dataset_yaml).expanduser()
         if not configured_yaml.is_absolute(): configured_yaml = (dataset_root / configured_yaml).resolve()
         try: dataset_yaml_rel = configured_yaml.resolve().relative_to(dataset_root).as_posix()
@@ -354,6 +368,9 @@ class RemoteJobBroker:
             "dataset_manifest": manifest, "controller_archive": str(archive_path),
             "dataset_yaml_rel": dataset_yaml_rel,
             "requested_worker_id": worker_id, "ram_mb": max(0, int(ram_mb)),
+            "gpu_memory_mb": max(0, int(gpu_memory_mb)),
+            "ram_safety_percent": max(0, min(90, int(ram_safety_percent))),
+            "gpu_memory_safety_mb": max(0, int(gpu_memory_safety_mb)),
             "minimum_free_disk_gb": max(estimated_disk_gb, float(minimum_free_disk_gb))}
         try:
             if self.database.get_experiment(experiment_id) is None:
@@ -378,6 +395,7 @@ class RemoteJobBroker:
                    for job in self.database.list_compute_jobs())
 
     def offer_next(self, worker_id: str):
+        self.database.expire_stale_workers()
         worker = self.database.get_worker(worker_id)
         if not worker: return None
         for active_job in self.database.list_compute_jobs():
@@ -390,10 +408,12 @@ class RemoteJobBroker:
             requirements = job.get("requirements", {})
             requested = requirements.get("requested_worker_id")
             if requested and requested != worker_id: continue
-            suitable, _reason = worker_suitability(worker, architecture=job["architecture"],
-                device=job["preferred_device"], ram_mb=requirements.get("ram_mb", 0),
-                disk_gb=requirements.get("minimum_free_disk_gb", 0), active_jobs=active,
-                gpu_memory_mb=requirements.get("gpu_memory_mb", 0))
+            active_rows = [row for row in self.database.list_compute_jobs()
+                           if row["origin"] == "remote" and row["worker_id"] == worker_id and
+                           row["state"] in {"preparing", "running", "validating"}]
+            reserved_ram = sum(int(row.get("requirements", {}).get("ram_mb", 0)) for row in active_rows)
+            suitable, _reason = remote_job_suitability(worker, job, active_jobs=active,
+                reserved_ram_mb=reserved_ram)
             if not suitable: continue
             if not self.database.reserve_compute_resources(job["id"], {"device_kind": "remote",
                     "dataset_bytes": requirements["dataset_manifest"]["total_bytes"]}, worker_id):
@@ -422,6 +442,8 @@ class RemoteJobBroker:
                     worker_software=worker.get("software", {}))
                 metadata.update(experiment_id=job["experiment_id"], remote_job=remote)
                 self.database.upsert_experiment(metadata)
+            self.database.record_security_event("remote_job_assigned", "compute_job", job["id"],
+                {"worker_id": worker_id, "architecture": job["architecture"]})
             return offer
         return None
 
@@ -472,6 +494,12 @@ class RemoteJobBroker:
             return {"request_id": message.get("request_id"), "job_id": job_id,
                     "sequence": int(message.get("sequence", 0)), "state": updated["state"]}
         if operation == "dataset_chunk":
+            with self._transfer_lock:
+                first_transfer = job_id not in self._transfer_events
+                self._transfer_events.add(job_id)
+            if first_transfer:
+                self.database.record_security_event("dataset_transfer_started", "compute_job", job_id,
+                    {"worker_id": worker_id, "dataset_id": job.get("requirements", {}).get("dataset_id")})
             requirements = job.get("requirements", {})
             path = Path(requirements.get("controller_archive", ""))
             offset, size = int(message.get("offset", -1)), int(message.get("size", 0))
@@ -498,7 +526,7 @@ class RemoteJobBroker:
             if name not in {"best.pt", "last.pt", "results.csv", "args.yaml"}:
                 raise PermissionError("Worker requested an unsupported artifact name.")
             expected_size = int(message.get("size", -1)); expected_hash = str(message.get("sha256", ""))
-            if expected_size < 0 or len(expected_hash) != 64:
+            if expected_size < 0 or expected_size > MAX_REMOTE_ARTIFACT_BYTES or len(expected_hash) != 64:
                 raise ValueError("Artifact size or hash is invalid.")
             artifact_dir = self.archive_root / job_id / "artifacts"
             destination = artifact_dir / name
@@ -517,6 +545,8 @@ class RemoteJobBroker:
                 offset = receiver.append(int(message.get("offset", -1)), block)
                 return {"request_id": message.get("request_id"), "job_id": job_id, "offset": offset}
             path = receiver.finalize()
+            self.database.record_security_event("artifact_retrieved", "compute_job", job_id,
+                {"worker_id": worker_id, "name": name, "size": receiver.expected_size, "sha256": receiver.expected_sha256})
             if job.get("experiment_id"):
                 experiment = self.database.get_experiment(job["experiment_id"])
                 metadata = dict(experiment.get("metadata", {})) if experiment else {}
@@ -759,8 +789,10 @@ class RemoteWorkerAgent:
 
 
 def worker_suitability(worker: dict, *, architecture: str, device: str = "auto", ram_mb: int = 0,
-                        disk_gb: float = 0, active_jobs: int = 0, gpu_memory_mb: int = 0) -> tuple[bool, str]:
-    """Return a user-readable compatibility decision using reported telemetry."""
+                        disk_gb: float = 0, active_jobs: int = 0, gpu_memory_mb: int = 0,
+                        ram_safety_mb: int = 0, reserved_ram_mb: int = 0,
+                        gpu_safety_mb: int = 0, reserved_gpu_mb: int = 0) -> tuple[bool, str]:
+    """Return a compatibility decision with the live resource arithmetic."""
     if worker.get("status") != "online": return False, "Worker is offline."
     if not worker.get("approved") or not worker.get("enabled"): return False, "Worker is not approved and enabled."
     hardware = worker.get("hardware") or {}; software = worker.get("software") or {}
@@ -770,25 +802,68 @@ def worker_suitability(worker: dict, *, architecture: str, device: str = "auto",
     if architecture not in supported:
         return False, f"Worker does not report support for {architecture}."
     memory = hardware.get("memory") or {}
-    if memory.get("available_mb") is not None and memory["available_mb"] < int(ram_mb):
-        return False, f"Worker has {memory['available_mb']} MB RAM available; {ram_mb} MB is requested."
+    available_ram = memory.get("available_mb")
+    if available_ram is None:
+        return False, "Worker RAM availability is unknown; wait for a fresh hardware heartbeat."
+    ram_after = int(available_ram) - int(reserved_ram_mb) - int(ram_mb)
+    if ram_after < int(ram_safety_mb):
+        return False, (f"RAM unsuitable: available {int(available_ram)} MB − reserved {int(reserved_ram_mb)} MB − "
+            f"job requirement {int(ram_mb)} MB = {ram_after} MB; safety reserve {int(ram_safety_mb)} MB.")
     free_disk = (hardware.get("disk") or {}).get("free_gb")
+    if free_disk is None and float(disk_gb) > 0:
+        return False, "Worker disk availability is unknown; wait for a fresh hardware heartbeat."
     if free_disk is not None and free_disk < float(disk_gb):
-        return False, f"Worker has {free_disk:g} GB disk free; {disk_gb:g} GB is requested."
+        return False, f"Disk unsuitable: worker has {free_disk:.2f} GB free; job needs {float(disk_gb):.2f} GB."
+    use_gpu = device.startswith("cuda") or (device == "auto" and bool(hardware.get("torch_cuda_available")))
     if device.startswith("cuda") and not hardware.get("torch_cuda_available"):
         return False, "Worker has no usable CUDA device."
-    if device.startswith("cuda"):
+    if use_gpu:
         gpus = hardware.get("gpus") or []
         try: index = int(device.split(":", 1)[1]) if ":" in device else 0
         except ValueError: return False, "Requested CUDA device index is invalid."
         if index < 0 or index >= len(gpus): return False, f"Worker does not report CUDA device {index}."
         free_vram = gpus[index].get("memory_free_mb")
-        if free_vram is not None and int(free_vram) < int(gpu_memory_mb):
-            return False, f"GPU {index} has {free_vram} MB VRAM free; {gpu_memory_mb} MB is requested."
+        if free_vram is None and (int(gpu_memory_mb) or int(gpu_safety_mb)):
+            return False, f"GPU {index} free VRAM is unknown; wait for a fresh hardware heartbeat."
+        if free_vram is not None:
+            vram_after = int(free_vram) - int(reserved_gpu_mb) - int(gpu_memory_mb)
+            if vram_after < int(gpu_safety_mb):
+                return False, (f"GPU {index} VRAM unsuitable: free {int(free_vram)} MB − reserved "
+                    f"{int(reserved_gpu_mb)} MB − job requirement {int(gpu_memory_mb)} MB = {vram_after} MB; "
+                    f"safety reserve {int(gpu_safety_mb)} MB.")
     versions = software or hardware.get("training_framework_versions") or {}
     if not versions.get("ultralytics") or not versions.get("torch"):
         return False, "Worker has not reported PyTorch and Ultralytics versions."
     if active_jobs:
         return False, f"Worker already has {active_jobs} active job(s); conservative scheduling allows one remote job at a time."
-    return True, "Online, approved, enabled, and reports required architecture and runtime."
+    disk_text = f"{float(free_disk):.2f} GB" if free_disk is not None else "unknown"
+    return True, (f"Suitable: RAM available {int(available_ram)} MB − reserved {int(reserved_ram_mb)} MB − "
+        f"job requirement {int(ram_mb)} MB = {ram_after} MB remaining; safety reserve {int(ram_safety_mb)} MB. "
+        f"Disk free {disk_text}; job needs {float(disk_gb):.2f} GB. "
+        "Worker is online, approved, enabled, and reports the requested architecture and runtime.")
+
+
+def remote_job_suitability(worker: dict, job: dict, *, active_jobs: int = 0,
+                           reserved_ram_mb: int = 0, reserved_gpu_mb: int = 0) -> tuple[bool, str]:
+    """Use the same live resource checks for controller assignment and UI diagnostics."""
+    requirements = job.get("requirements", {})
+    hardware = worker.get("hardware") or {}
+    total_ram = (hardware.get("memory") or {}).get("total_mb")
+    if requirements.get("ram_safety_percent", 20) and total_ram is None:
+        return False, "Worker total RAM is unknown; wait for a complete hardware heartbeat before scheduling."
+    ram_safety_mb = int(total_ram * int(requirements.get("ram_safety_percent", 20)) / 100) if total_ram else 0
+    last_seen = worker.get("last_seen")
+    if last_seen:
+        try:
+            seen = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - seen.astimezone(timezone.utc)).total_seconds() > 30:
+                return False, "Worker heartbeat is stale; wait for the worker to reconnect."
+        except ValueError:
+            return False, "Worker heartbeat timestamp is invalid; wait for a fresh heartbeat."
+    return worker_suitability(worker, architecture=job.get("architecture", ""),
+        device=job.get("preferred_device", "auto"), ram_mb=requirements.get("ram_mb", 0),
+        disk_gb=requirements.get("minimum_free_disk_gb", 0), active_jobs=active_jobs,
+        gpu_memory_mb=requirements.get("gpu_memory_mb", 0), ram_safety_mb=ram_safety_mb,
+        reserved_ram_mb=reserved_ram_mb, gpu_safety_mb=requirements.get("gpu_memory_safety_mb", 0),
+        reserved_gpu_mb=reserved_gpu_mb)
 

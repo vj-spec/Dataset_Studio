@@ -31,10 +31,11 @@ This guide maps the main files in this repository to their responsibilities. The
 | `yolo_trainer.py` | Existing Ultralytics YOLO training worker and model-training callbacks reused by the YOLO adapter. |
 | `compute_training_process.py` | Internal child-process entry point. Loads a fixed local adapter/configuration, reports structured events, and watches a per-job control file for safe stop requests. It is not a separate application. |
 | `compute_manager.py` | Hardware/resource profiles, local job scheduling/reservations, operating-mode manager, TLS worker enrollment/heartbeat services, and credential protection. |
+| `compute_security.py` | Built-in controller CA/certificate lifecycle, SAN and key validation, DPAPI-protected controller keys, and public-CA one-time enrollment package validation. Called by Compute Center setup and enrollment flows. |
 | `distributed_training.py` | Remote job validation and broker, worker suitability, SHA-256 dataset manifests, streaming archives, verified cache, resumable file receiver, remote adapter execution, and artifact receipt. Called by `compute_manager.py` and `compute_studio.py`; receives validated configs, dataset folders, and authenticated messages, and produces persistent job/experiment updates and verified files. |
 | `compute_studio.py` | Compute Center UI: local hardware, workers, jobs, and compute settings. |
 | `hardware.py` | CPU, memory, disk, GPU, CUDA, and training-runtime discovery. Optional tools may leave some telemetry unavailable. |
-| `experiment_database.py` | SQLite schema and persistence for experiments, metrics, artifacts, model registry, compute profiles, jobs, workers, and sequenced remote job progress. Schema version 3 adds remote updates while retaining existing records. |
+| `experiment_database.py` | SQLite schema and persistence for experiments, metrics, artifacts, model registry, compute profiles, jobs, workers, sequenced remote job progress, hashed enrollment-token state, job archival, revoked-worker removal, and security events. Schema version 5 migrates earlier databases in place. |
 | `experiment_manager.py` | Experiment services for training history, evaluation, benchmarking, model versions, and artifact references. |
 | `experiment_studio.py` | Experiments, comparison, evaluation/benchmark, and model registry UI panels. |
 
@@ -69,7 +70,7 @@ This guide maps the main files in this repository to their responsibilities. The
 5. The agent validates the architecture-specific config and starts `IsolatedTrainingWorker`, which uses `compute_training_process.py` and the existing YOLO or RT-DETR adapter. Progress and available metrics return as sequenced messages.
 6. The worker sends allowlisted artifacts in verified blocks. The controller publishes them only after complete size and SHA-256 validation, then updates the central experiment record. The model registry is unchanged unless a user explicitly registers a model.
 
-Remote jobs are not dispatched by `LocalJobScheduler`; that scheduler remains responsible for local training. Worker connections are outbound from the worker. The controller listener is TLS-protected and must be reachable on the configured port. Long outages and worker restarts require user review; no automatic retry is performed.
+Remote jobs are not dispatched by `LocalJobScheduler`; that scheduler remains responsible for local training. Worker connections are outbound from the worker. The controller listener is TLS-protected, starts on loopback by default, and must be explicitly bound to a reachable interface. Long outages and worker restarts require user review; no automatic training retry is performed. Resource suitability is calculated from fresh heartbeat values, job requests, reservations and safety margins.
 
 ## Useful commands
 

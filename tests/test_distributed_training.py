@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from distributed_training import (DatasetCache, RemoteJobBroker, RemoteWorkerAgent, ResumableFileReceiver, create_dataset_archive,
-    dataset_manifest, validate_job_spec, worker_suitability)
+    dataset_manifest, remote_job_suitability, validate_job_spec, worker_suitability)
 from experiment_database import ExperimentDatabase
 
 
@@ -103,6 +103,17 @@ class DistributedTrainingPrimitivesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             DatasetCache(self.root / "worker-cache").stage_archive(self.root / "missing.zip", manifest)
 
+    def test_remote_dataset_archive_size_limit_is_enforced_before_job_creation(self):
+        database = ExperimentDatabase(self.root / "archive-limit.sqlite3")
+        broker = RemoteJobBroker(database, self.root / "archive-limit")
+        config = {"architecture": "YOLO", "model_version": "YOLO26", "initial_weights": "yolo26n.pt",
+            "dataset_yaml": str(self.dataset / "data.yaml"), "output_directory": "runs", "experiment_name": "large",
+            "device": "cpu", "epochs": 1, "batch_size": 1, "image_size": 64, "workers": 0, "precision": "auto"}
+        with patch("distributed_training.MAX_DATASET_ARCHIVE_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "remote archive size limit"):
+                broker.submit(config, self.dataset)
+        self.assertEqual(database.list_compute_jobs(), [])
+
     def test_resumable_file_transfer_verifies_and_refuses_overwrite(self):
         content = b"checkpoint-content"; path = self.root / "received" / "best.pt"
         receiver = ResumableFileReceiver(path, len(content), hashlib.sha256(content).hexdigest())
@@ -135,7 +146,7 @@ class DistributedTrainingPrimitivesTests(unittest.TestCase):
     def test_worker_suitability_explains_incompatibility_and_accepts_compatible_worker(self):
         worker = {"status": "online", "approved": True, "enabled": True,
             "hardware": {"supported_training_architectures": ["YOLO"], "torch_cuda_available": False,
-                "memory": {"available_mb": 4096}, "disk": {"free_gb": 20}},
+                "memory": {"available_mb": 4096, "total_mb": 8192}, "disk": {"free_gb": 20}},
             "software": {"torch": "2.15", "ultralytics": "8.4"}}
         self.assertEqual(worker_suitability(worker, architecture="YOLO", ram_mb=1024)[0], True)
         ok, reason = worker_suitability(worker, architecture="RT-DETR")
@@ -143,18 +154,82 @@ class DistributedTrainingPrimitivesTests(unittest.TestCase):
         ok, reason = worker_suitability(worker, architecture="YOLO", device="cuda")
         self.assertFalse(ok); self.assertIn("CUDA", reason)
 
+    def test_remote_scheduling_ram_margin_reservations_and_disk_are_explicit(self):
+        worker = {"status": "online", "approved": True, "enabled": True,
+            "hardware": {"supported_training_architectures": ["YOLO"], "torch_cuda_available": False,
+                "memory": {"available_mb": 2441, "total_mb": 8192}, "disk": {"free_gb": 4.5}},
+            "software": {"torch": "2.15", "ultralytics": "8.4"}}
+        job = {"architecture": "YOLO", "preferred_device": "cpu", "requirements": {
+            "ram_mb": 1229, "ram_safety_percent": 5, "minimum_free_disk_gb": 2.0}}
+        suitable, reason = remote_job_suitability(worker, job)
+        self.assertTrue(suitable, reason)
+        self.assertIn("RAM available 2441 MB", reason)
+        self.assertIn("job requirement 1229 MB", reason)
+        self.assertIn("safety reserve 409 MB", reason)
+        self.assertIn("Disk free 4.50 GB", reason)
+        suitable, reason = remote_job_suitability(worker, job, reserved_ram_mb=900)
+        self.assertFalse(suitable)
+        self.assertIn("reserved 900 MB", reason)
+        worker["hardware"]["memory"]["available_mb"] = 900
+        suitable, reason = remote_job_suitability(worker, job)
+        self.assertFalse(suitable); self.assertIn("RAM unsuitable", reason)
+        worker["hardware"]["memory"].pop("available_mb")
+        suitable, reason = remote_job_suitability(worker, job)
+        self.assertFalse(suitable); self.assertIn("availability is unknown", reason)
+
+    def test_gpu_memory_and_stale_or_missing_worker_hardware_reject_safely(self):
+        worker = {"status": "online", "approved": True, "enabled": True,
+            "hardware": {"supported_training_architectures": ["YOLO"], "torch_cuda_available": True,
+                "memory": {"available_mb": 8000, "total_mb": 16000},
+                "disk": {"free_gb": 100}, "gpus": [{"memory_free_mb": 3500}]},
+            "software": {"torch": "2.15", "ultralytics": "8.4"}}
+        job = {"architecture": "YOLO", "preferred_device": "cuda:0", "requirements": {
+            "ram_mb": 500, "ram_safety_percent": 10, "gpu_memory_mb": 2000,
+            "gpu_memory_safety_mb": 2048, "minimum_free_disk_gb": 1}}
+        suitable, reason = remote_job_suitability(worker, job)
+        self.assertFalse(suitable); self.assertIn("VRAM unsuitable", reason)
+        worker["hardware"]["gpus"][0].pop("memory_free_mb")
+        suitable, reason = remote_job_suitability(worker, job)
+        self.assertFalse(suitable); self.assertIn("VRAM is unknown", reason)
+        worker["hardware"]["gpus"][0]["memory_free_mb"] = 8000
+        worker["last_seen"] = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+        suitable, reason = remote_job_suitability(worker, job)
+        self.assertFalse(suitable); self.assertIn("heartbeat is stale", reason)
+
+    def test_live_ram_change_between_worker_heartbeats_changes_assignment(self):
+        database = ExperimentDatabase(self.root / "changing-hardware.sqlite3")
+        token_hash = hashlib.sha256(b"hardware-change").digest()
+        database.add_enrollment_token(token_hash, (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
+        database.enroll_worker(token_hash, "ram-worker", "RAM Worker", "", "credential",
+            {"supported_training_architectures": ["YOLO"], "torch_cuda_available": False,
+             "memory": {"available_mb": 12000, "total_mb": 16000}, "disk": {"free_gb": 20}},
+            {"torch": "2.15", "ultralytics": "8.4"})
+        database.set_worker_approved("ram-worker", True)
+        hardware = {"supported_training_architectures": ["YOLO"], "torch_cuda_available": False,
+            "memory": {"available_mb": 12000, "total_mb": 16000}, "disk": {"free_gb": 20}}
+        database.record_worker_heartbeat("ram-worker", "session", hardware, {"torch": "2.15", "ultralytics": "8.4"})
+        broker = RemoteJobBroker(database, self.root / "ram-change-archives")
+        job_id = broker.submit({"architecture": "YOLO", "model_version": "YOLO26", "initial_weights": "yolo26n.pt",
+            "dataset_yaml": str(self.dataset / "data.yaml"), "output_directory": "runs", "experiment_name": "ram",
+            "device": "cpu", "epochs": 1, "batch_size": 1, "image_size": 64, "workers": 0, "precision": "auto"},
+            self.dataset, ram_mb=6000, ram_safety_percent=10)
+        hardware["memory"]["available_mb"] = 2000
+        database.record_worker_heartbeat("ram-worker", "session", hardware, {"torch": "2.15", "ultralytics": "8.4"})
+        self.assertIsNone(broker.offer_next("ram-worker"))
+        self.assertEqual(database.get_compute_job(job_id)["state"], "queued")
+
     def test_remote_broker_assigns_once_and_persists_authorized_progress(self):
         database = ExperimentDatabase(self.root / "experiments.sqlite3")
         token = b"registration"; token_hash = hashlib.sha256(token).digest()
         database.add_enrollment_token(token_hash, (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
         database.enroll_worker(token_hash, "worker-a", "Worker A", "", "credential",
             {"supported_training_architectures": ["YOLO"], "torch_cuda_available": False,
-             "memory": {"available_mb": 8192}, "disk": {"free_gb": 50}},
+             "memory": {"available_mb": 8192, "total_mb": 16384}, "disk": {"free_gb": 50}},
             {"torch": "2.15", "ultralytics": "8.4"})
         database.set_worker_approved("worker-a", True)
         database.record_worker_heartbeat("worker-a", "session",
             {"supported_training_architectures": ["YOLO"], "torch_cuda_available": False,
-             "memory": {"available_mb": 8192}, "disk": {"free_gb": 50}},
+             "memory": {"available_mb": 8192, "total_mb": 16384}, "disk": {"free_gb": 50}},
             {"torch": "2.15", "ultralytics": "8.4"})
         broker = RemoteJobBroker(database, self.root / "controller-archives")
         config = {"architecture": "YOLO", "model_version": "YOLO26", "initial_weights": "yolo26n.pt",
@@ -235,7 +310,7 @@ class DistributedTrainingPrimitivesTests(unittest.TestCase):
         database.enroll_worker(enrollment_hash, "worker-b", "Worker B", "", "secret", {}, {})
         database.set_worker_approved("worker-b", True)
         database.record_worker_heartbeat("worker-b", "session-b", {"supported_training_architectures": ["YOLO", "RT-DETR"],
-            "torch_cuda_available": False, "memory": {"available_mb": 8192}, "disk": {"free_gb": 30}},
+            "torch_cuda_available": False, "memory": {"available_mb": 8192, "total_mb": 16384}, "disk": {"free_gb": 30}},
             {"torch": "2.15", "ultralytics": "8.4"})
         broker=RemoteJobBroker(database, self.root / "controller-archives")
         for architecture, model, precision in (("YOLO", "YOLO26", "auto"), ("RT-DETR", "RT-DETR-ResNet50", "fp32")):

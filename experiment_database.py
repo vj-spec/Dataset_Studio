@@ -8,14 +8,14 @@ import sqlite3
 import uuid
 import secrets
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from config import app_state_file
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def _now() -> str:
@@ -113,11 +113,13 @@ class ExperimentDatabase:
                     status TEXT NOT NULL DEFAULT 'offline', approved INTEGER NOT NULL DEFAULT 0,
                     enabled INTEGER NOT NULL DEFAULT 1, credential_salt BLOB NOT NULL, credential_hash BLOB NOT NULL,
                     hardware_json TEXT NOT NULL DEFAULT '{}', software_json TEXT NOT NULL DEFAULT '{}',
-                    last_seen TEXT, created_at TEXT NOT NULL, revoked_at TEXT, connection_id TEXT
+                    last_seen TEXT, created_at TEXT NOT NULL, revoked_at TEXT, connection_id TEXT,
+                    removed_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status,approved,enabled);
                 CREATE TABLE IF NOT EXISTS enrollment_tokens(
-                    token_hash BLOB PRIMARY KEY, expires_at TEXT NOT NULL, consumed_at TEXT, created_at TEXT NOT NULL
+                    token_hash BLOB PRIMARY KEY, expires_at TEXT NOT NULL, consumed_at TEXT, created_at TEXT NOT NULL,
+                    revoked_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS worker_heartbeats(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id TEXT NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
@@ -130,7 +132,7 @@ class ExperimentDatabase:
                     worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL, priority INTEGER NOT NULL DEFAULT 0,
                     state TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, ended_at TEXT,
                     error TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT 'local',
-                    dedupe_key TEXT
+                    dedupe_key TEXT, archived INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_compute_jobs_queue ON compute_jobs(state,priority DESC,created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_compute_jobs_active_dedupe ON compute_jobs(dedupe_key)
@@ -148,7 +150,21 @@ class ExperimentDatabase:
                     state TEXT NOT NULL, progress_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
                     PRIMARY KEY(job_id,sequence)
                 );
+                CREATE TABLE IF NOT EXISTS security_events(
+                    event_id TEXT PRIMARY KEY, category TEXT NOT NULL, subject_type TEXT NOT NULL DEFAULT '',
+                    subject_id TEXT NOT NULL DEFAULT '', details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_security_events_created ON security_events(created_at DESC);
             """)
+            token_columns = {row[1] for row in db.execute("PRAGMA table_info(enrollment_tokens)")}
+            if "revoked_at" not in token_columns:
+                db.execute("ALTER TABLE enrollment_tokens ADD COLUMN revoked_at TEXT")
+            job_columns = {row[1] for row in db.execute("PRAGMA table_info(compute_jobs)")}
+            if "archived" not in job_columns:
+                db.execute("ALTER TABLE compute_jobs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+            worker_columns = {row[1] for row in db.execute("PRAGMA table_info(workers)")}
+            if "removed_at" not in worker_columns:
+                db.execute("ALTER TABLE workers ADD COLUMN removed_at TEXT")
             version = db.execute("SELECT version FROM schema_info LIMIT 1").fetchone()
             if version is None:
                 db.execute("INSERT INTO schema_info(version) VALUES (?)", (SCHEMA_VERSION,))
@@ -347,20 +363,72 @@ class ExperimentDatabase:
             db.execute("INSERT INTO enrollment_tokens(token_hash,expires_at,created_at) VALUES(?,?,?)",
                        (token_hash, expires_at, _now()))
 
+    def list_enrollment_tokens(self, limit=100):
+        with self._connect() as db:
+            rows = db.execute("SELECT token_hash,expires_at,consumed_at,created_at,revoked_at FROM enrollment_tokens ORDER BY created_at DESC LIMIT ?",
+                              (max(1, min(int(limit), 1000)),)).fetchall()
+        return [{"token_id": bytes(row[0]).hex()[:12], "expires_at": row[1], "consumed_at": row[2],
+                 "created_at": row[3], "revoked_at": row[4],
+                 "status": ("consumed" if row[2] else "revoked" if row[4] else "expired" if row[1] <= _now() else "unused")}
+                for row in rows]
+
+    def revoke_enrollment_token(self, token: str):
+        token_hash = hashlib.sha256(token.encode("utf-8")).digest()
+        with self._connect() as db:
+            changed = db.execute("UPDATE enrollment_tokens SET revoked_at=? WHERE token_hash=? AND consumed_at IS NULL AND revoked_at IS NULL",
+                                 (_now(), token_hash)).rowcount
+        if changed:
+            self.record_security_event("enrollment_token_revoked", "enrollment_token", token_hash.hex()[:12])
+        return bool(changed)
+
+    def revoke_unused_enrollment_tokens(self):
+        with self._connect() as db:
+            changed = db.execute("UPDATE enrollment_tokens SET revoked_at=? WHERE consumed_at IS NULL AND revoked_at IS NULL AND expires_at>?",
+                                 (_now(), _now())).rowcount
+        if changed:
+            self.record_security_event("unused_enrollment_tokens_revoked", "enrollment_token", details={"count": changed})
+        return changed
+
+    def record_security_event(self, category: str, subject_type="", subject_id="", details=None):
+        """Persist structured security metadata while redacting credential-like fields."""
+        def scrub(value):
+            if isinstance(value, dict):
+                return {str(key)[:80]: ("[redacted]" if any(term in str(key).lower()
+                        for term in ("token", "credential", "secret", "private_key", "password"))
+                        else scrub(item)) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [scrub(item) for item in value[:100]]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value if not isinstance(value, str) else value[:1000]
+            return str(value)[:1000]
+        with self._connect() as db:
+            db.execute("INSERT INTO security_events(event_id,category,subject_type,subject_id,details_json,created_at) VALUES(?,?,?,?,?,?)",
+                       (uuid.uuid4().hex, str(category)[:100], str(subject_type)[:80], str(subject_id)[:160],
+                        _json(scrub(details or {})), _now()))
+
+    def list_security_events(self, limit=200):
+        with self._connect() as db:
+            rows = db.execute("SELECT * FROM security_events ORDER BY created_at DESC LIMIT ?",
+                              (max(1, min(int(limit), 5000)),)).fetchall()
+        return [{"event_id": row["event_id"], "category": row["category"],
+                 "subject_type": row["subject_type"], "subject_id": row["subject_id"],
+                 "details": json.loads(row["details_json"]), "created_at": row["created_at"]} for row in rows]
+
     def enroll_worker(self, token_hash: bytes, worker_id: str, name: str, endpoint: str, credential: str,
                       hardware: dict, software: dict):
         salt = secrets.token_bytes(16)
         credential_hash = hashlib.pbkdf2_hmac("sha256", credential.encode("utf-8"), salt, 240_000)
         now = _now()
         with self._connect() as db:
-            token = db.execute("SELECT expires_at,consumed_at FROM enrollment_tokens WHERE token_hash=?", (token_hash,)).fetchone()
-            if token is None or token[1] is not None or token[0] <= now:
+            token = db.execute("SELECT expires_at,consumed_at,revoked_at FROM enrollment_tokens WHERE token_hash=?", (token_hash,)).fetchone()
+            if token is None or token[1] is not None or token[2] is not None or token[0] <= now:
                 raise PermissionError("Enrollment token is invalid, expired, or already used.")
             if db.execute("UPDATE enrollment_tokens SET consumed_at=? WHERE token_hash=? AND consumed_at IS NULL", (now, token_hash)).rowcount != 1:
                 raise PermissionError("Enrollment token was already consumed.")
             db.execute("INSERT INTO workers(id,name,endpoint,status,approved,enabled,credential_salt,credential_hash,hardware_json,software_json,last_seen,created_at) "
                        "VALUES(?,?,?,'pending',0,1,?,?,?,?,?,?)",
                        (worker_id, name, endpoint, salt, credential_hash, _json(hardware), _json(software), now, now))
+        self.record_security_event("worker_enrolled", "worker", worker_id, {"name": name, "endpoint": endpoint})
         return self.get_worker(worker_id)
 
     def authenticate_worker(self, worker_id: str, credential: str):
@@ -379,10 +447,13 @@ class ExperimentDatabase:
                 last_seen,created_at,revoked_at,connection_id FROM workers WHERE id=?""", (worker_id,)).fetchone()
         return self._decode(row)
 
-    def list_workers(self):
+    def list_workers(self, *, include_removed=False):
         with self._connect() as db:
-            rows = db.execute("""SELECT id,name,endpoint,status,approved,enabled,hardware_json,software_json,
-                last_seen,created_at,revoked_at,connection_id FROM workers ORDER BY name,id""").fetchall()
+            query = """SELECT id,name,endpoint,status,approved,enabled,hardware_json,software_json,
+                last_seen,created_at,revoked_at,connection_id,removed_at FROM workers"""
+            if not include_removed:
+                query += " WHERE removed_at IS NULL"
+            rows = db.execute(query + " ORDER BY name,id").fetchall()
         return [self._decode(row) for row in rows]
 
     def set_worker_approved(self, worker_id: str, approved: bool):
@@ -391,6 +462,7 @@ class ExperimentDatabase:
                 raise KeyError(worker_id)
             db.execute("UPDATE workers SET status=CASE WHEN ?=0 THEN 'pending' WHEN connection_id IS NOT NULL THEN 'online' ELSE 'offline' END WHERE id=?",
                        (int(approved), worker_id))
+        self.record_security_event("worker_approved" if approved else "worker_approval_removed", "worker", worker_id)
         return self.get_worker(worker_id)
 
     def set_worker_enabled(self, worker_id: str, enabled: bool):
@@ -398,18 +470,39 @@ class ExperimentDatabase:
             if db.execute("UPDATE workers SET enabled=?,status=CASE WHEN ?=0 THEN 'disabled' ELSE 'offline' END WHERE id=? AND revoked_at IS NULL",
                           (int(enabled), int(enabled), worker_id)).rowcount != 1:
                 raise KeyError(worker_id)
+        self.record_security_event("worker_enabled" if enabled else "worker_disabled", "worker", worker_id)
         return self.get_worker(worker_id)
 
     def revoke_worker(self, worker_id: str):
         with self._connect() as db:
-            if db.execute("UPDATE workers SET revoked_at=?,status='revoked',connection_id=NULL WHERE id=?", (_now(), worker_id)).rowcount != 1:
+            if db.execute("UPDATE workers SET revoked_at=?,status='revoked',connection_id=NULL WHERE id=? AND removed_at IS NULL", (_now(), worker_id)).rowcount != 1:
                 raise KeyError(worker_id)
+        self.record_security_event("worker_revoked", "worker", worker_id)
+
+    def remove_revoked_worker(self, worker_id: str):
+        """Hide a revoked registration without deleting its audit/job history."""
+        with self._connect() as db:
+            worker = db.execute("SELECT revoked_at,connection_id,removed_at FROM workers WHERE id=?", (worker_id,)).fetchone()
+            if worker is None or worker[2] is not None:
+                raise KeyError(worker_id)
+            if worker[0] is None:
+                raise ValueError("Revoke the worker credentials before removing this worker.")
+            if worker[1] is not None:
+                raise ValueError("Worker is still connected. Wait for it to disconnect before removing it.")
+            active = db.execute("SELECT id,state FROM compute_jobs WHERE worker_id=? AND state IN ('queued','preparing','running','validating') LIMIT 1", (worker_id,)).fetchone()
+            if active:
+                raise ValueError(f"Worker still has active job {active[0]} ({active[1]}). Stop and reconcile that job before removal.")
+            db.execute("UPDATE workers SET removed_at=? WHERE id=?", (_now(), worker_id))
+        self.record_security_event("worker_record_removed", "worker", worker_id,
+                                   {"preserved_job_history": True, "preserved_audit_history": True})
 
     def record_worker_heartbeat(self, worker_id: str, connection_id: str, hardware: dict, software: dict):
         now = _now()
         with self._connect() as db:
-            row = db.execute("SELECT approved,enabled,revoked_at FROM workers WHERE id=?", (worker_id,)).fetchone()
+            row = db.execute("SELECT approved,enabled,revoked_at,connection_id FROM workers WHERE id=?", (worker_id,)).fetchone()
             if row is None or not row[1] or row[2] is not None:
+                return False
+            if row[3] is not None and row[3] != connection_id:
                 return False
             state = "online" if row[0] else "pending"
             db.execute("UPDATE workers SET status=?,hardware_json=?,software_json=?,last_seen=?,connection_id=? WHERE id=?",
@@ -417,6 +510,16 @@ class ExperimentDatabase:
             db.execute("INSERT INTO worker_heartbeats(worker_id,received_at,hardware_json,software_json) VALUES(?,?,?,?)",
                        (worker_id, now, _json(hardware), _json(software)))
         return True
+
+    def expire_stale_workers(self, timeout_seconds=30):
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(5, int(timeout_seconds)))).isoformat()
+        with self._connect() as db:
+            rows = db.execute("SELECT id FROM workers WHERE connection_id IS NOT NULL AND last_seen<? AND revoked_at IS NULL", (cutoff,)).fetchall()
+            if rows:
+                db.execute("UPDATE workers SET status=CASE WHEN approved=1 THEN 'offline' ELSE 'pending' END,connection_id=NULL WHERE connection_id IS NOT NULL AND last_seen<? AND revoked_at IS NULL", (cutoff,))
+        for row in rows:
+            self.record_security_event("worker_heartbeat_timeout", "worker", row[0], {"timeout_seconds": timeout_seconds})
+        return [row[0] for row in rows]
 
     def disconnect_worker(self, worker_id: str, connection_id: str):
         with self._connect() as db:
@@ -450,8 +553,42 @@ class ExperimentDatabase:
 
     def list_compute_jobs(self):
         with self._connect() as db:
-            rows = db.execute("SELECT j.*,w.name AS worker_name FROM compute_jobs j LEFT JOIN workers w ON w.id=j.worker_id ORDER BY CASE j.state WHEN 'running' THEN 0 WHEN 'preparing' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END,j.priority DESC,j.created_at").fetchall()
+            rows = db.execute("SELECT j.*,w.name AS worker_name FROM compute_jobs j LEFT JOIN workers w ON w.id=j.worker_id ORDER BY j.archived,CASE j.state WHEN 'running' THEN 0 WHEN 'preparing' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END,j.priority DESC,j.created_at").fetchall()
         return [self._decode(row) for row in rows]
+
+    def archive_compute_jobs(self, job_ids):
+        job_ids = list(dict.fromkeys(str(job_id) for job_id in job_ids))
+        if not job_ids: return 0
+        with self._connect() as db:
+            placeholders = ",".join("?" for _ in job_ids)
+            active = db.execute(f"SELECT id FROM compute_jobs WHERE id IN ({placeholders}) AND state IN ('queued','preparing','running','validating')", job_ids).fetchall()
+            if active: raise ValueError("Active jobs cannot be archived. Cancel or stop them and wait for a terminal state.")
+            changed = db.execute(f"UPDATE compute_jobs SET archived=1 WHERE id IN ({placeholders}) AND state IN ('completed','failed','cancelled')", job_ids).rowcount
+        if changed: self.record_security_event("job_history_archived", "compute_job", details={"job_count": changed})
+        return changed
+
+    def delete_compute_jobs(self, job_ids):
+        job_ids = list(dict.fromkeys(str(job_id) for job_id in job_ids))
+        if not job_ids: return 0
+        with self._connect() as db:
+            placeholders = ",".join("?" for _ in job_ids)
+            rows = db.execute(f"SELECT id,state,origin,worker_id FROM compute_jobs WHERE id IN ({placeholders})", job_ids).fetchall()
+            active = [row["id"] for row in rows if row["state"] in {"queued", "preparing", "running", "validating"}]
+            if active: raise ValueError("Active jobs cannot be deleted. Cancel or stop them and wait for a terminal state.")
+            for row in rows:
+                if row["origin"] == "remote" and row["worker_id"] and row["state"] != "cancelled":
+                    terminal = db.execute("SELECT state FROM remote_job_updates WHERE job_id=? ORDER BY sequence DESC LIMIT 1", (row["id"],)).fetchone()
+                    if terminal is None or terminal[0] not in {"completed", "failed", "cancelled"}:
+                        raise ValueError("Remote job has no worker-confirmed terminal update; verify the worker stopped before deleting its history.")
+            deleted = db.execute(f"DELETE FROM compute_jobs WHERE id IN ({placeholders}) AND state IN ('completed','failed','cancelled')", job_ids).rowcount
+        if deleted: self.record_security_event("job_history_deleted", "compute_job", details={"job_count": deleted})
+        return deleted
+
+    def clear_terminal_compute_jobs(self, *, archived_only=False):
+        with self._connect() as db:
+            predicate = "state IN ('completed','failed','cancelled')" + (" AND archived=1" if archived_only else "")
+            rows = db.execute(f"SELECT id FROM compute_jobs WHERE {predicate}").fetchall()
+        return self.delete_compute_jobs([row[0] for row in rows])
 
     def set_compute_job_state(self, job_id: str, state: str, *, error: str = "", worker_id: str | None = None):
         allowed = {"queued", "preparing", "running", "validating", "completed", "failed", "cancelled"}
@@ -525,18 +662,24 @@ class ExperimentDatabase:
                 for row in rows]
 
     def request_remote_job_cancel(self, job_id: str):
+        event_needed = False
         with self._connect() as db:
             row = db.execute("SELECT state,origin,requirements_json FROM compute_jobs WHERE id=?", (job_id,)).fetchone()
             if row is None: raise KeyError(job_id)
             if row["origin"] != "remote": raise ValueError("Job is not a remote job.")
             if row["state"] == "queued":
                 db.execute("UPDATE compute_jobs SET state='cancelled',ended_at=? WHERE id=?", (_now(), job_id))
-                return "cancelled"
-            if row["state"] in {"completed", "failed", "cancelled"}: return row["state"]
-            requirements = json.loads(row["requirements_json"] or "{}")
-            requirements["cancel_requested"] = True
-            db.execute("UPDATE compute_jobs SET requirements_json=? WHERE id=?", (_json(requirements), job_id))
-            return "requested"
+                result = "cancelled"; event_needed = True
+            elif row["state"] in {"completed", "failed", "cancelled"}:
+                result = row["state"]
+            else:
+                requirements = json.loads(row["requirements_json"] or "{}")
+                requirements["cancel_requested"] = True
+                db.execute("UPDATE compute_jobs SET requirements_json=? WHERE id=?", (_json(requirements), job_id))
+                result = "requested"; event_needed = True
+        if event_needed:
+            self.record_security_event("remote_job_cancellation_requested", "compute_job", job_id, {"state": result})
+        return result
 
 
 _METRIC_ALIASES = {

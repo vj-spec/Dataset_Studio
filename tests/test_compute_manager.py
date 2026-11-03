@@ -12,12 +12,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QThread, Signal
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QStackedWidget, QVBoxLayout, QWidget, QPushButton
 
 import hardware
 from compute_manager import (ComputeControllerServer, ComputeEvents, ComputeWorkerClient,
     DPAPICredentialStore, LocalJobScheduler, ResourceProfile, UnifiedComputeManager)
-from compute_studio import ComputeCenterPanel
+from compute_studio import ComputeCenterPanel, _EnrollmentTokenDialog
 from experiment_database import ExperimentDatabase
 
 
@@ -165,6 +165,83 @@ class ComputeManagerTests(unittest.TestCase):
         self.db.revoke_worker("node")
         self.assertFalse(self.db.record_worker_heartbeat("node", "session", {}, {}))
 
+    def test_token_revocation_consumption_status_and_secret_redaction(self):
+        manager = UnifiedComputeManager(self.db, credential_store=FakeCredentialStore())
+        token, _expires = manager.create_enrollment_token()
+        token_id = hashlib.sha256(token.encode()).hexdigest()[:12]
+        self.assertEqual(next(row for row in self.db.list_enrollment_tokens() if row["token_id"] == token_id)["status"], "unused")
+        self.assertTrue(self.db.revoke_enrollment_token(token))
+        self.assertEqual(next(row for row in self.db.list_enrollment_tokens() if row["token_id"] == token_id)["status"], "revoked")
+        with self.assertRaisesRegex(PermissionError, "invalid, expired, or already used"):
+            self.db.enroll_worker(hashlib.sha256(token.encode()).digest(), "revoked-node", "Node", "", "secret", {}, {})
+        events = self.db.list_security_events()
+        self.assertTrue(any(event["category"] == "enrollment_token_created" for event in events))
+        self.assertNotIn(token, json.dumps(events))
+        manager.close()
+
+    def test_expired_enrollment_token_is_rejected(self):
+        token = "expired-token-value"
+        token_hash = hashlib.sha256(token.encode()).digest()
+        self.db.add_enrollment_token(token_hash, (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
+        with self.assertRaisesRegex(PermissionError, "invalid, expired, or already used"):
+            self.db.enroll_worker(token_hash, "expired-node", "Expired", "", "secret", {}, {})
+
+    def test_unapproved_worker_cannot_send_remote_job_messages(self):
+        token_hash = hashlib.sha256(b"pending-worker").digest()
+        self.db.add_enrollment_token(token_hash, (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
+        self.db.enroll_worker(token_hash, "pending", "Pending", "", "secret", {}, {})
+        worker_to_controller = queue.Queue(); controller_to_worker = queue.Queue()
+        raw = FakePipeSocket(worker_to_controller, controller_to_worker)
+        worker_to_controller.put((json.dumps({"type": "authenticate", "worker_id": "pending", "credential": "secret", "hardware": {}, "software": {}}) + "\n").encode())
+        worker_to_controller.put((json.dumps({"type": "heartbeat", "hardware": {}, "software": {},
+            "remote": [{"type": "progress", "job_id": "forged"}]}) + "\n").encode())
+        handled = []; errors = []
+        class ControllerTLS:
+            def wrap_socket(self, sock, **_kwargs): return sock
+        server = ComputeControllerServer(self.db, "127.0.0.1", 0, "unused", "unused",
+            error_event=errors.append, remote_handler=lambda worker, message: handled.append(message))
+        thread = threading.Thread(target=server._serve_client, args=(raw, ("127.0.0.1", 2), ControllerTLS()), daemon=True)
+        thread.start(); thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(handled, [])
+        self.assertTrue(any("approval is required" in error for error in errors))
+
+    def test_worker_session_is_unique_and_stale_connection_can_reconnect(self):
+        token_hash = hashlib.sha256(b"single-session").digest()
+        self.db.add_enrollment_token(token_hash, (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
+        self.db.enroll_worker(token_hash, "single", "Single", "", "secret", {}, {})
+        self.db.set_worker_approved("single", True)
+        self.assertTrue(self.db.record_worker_heartbeat("single", "session-a", {"memory": {"available_mb": 1000}}, {}))
+        self.assertFalse(self.db.record_worker_heartbeat("single", "session-b", {"memory": {"available_mb": 900}}, {}))
+        old = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+        with self.db._connect() as conn: conn.execute("UPDATE workers SET last_seen=? WHERE id='single'", (old,))
+        self.assertEqual(self.db.expire_stale_workers(30), ["single"])
+        self.assertTrue(self.db.record_worker_heartbeat("single", "session-b", {"memory": {"available_mb": 900}}, {}))
+
+    def test_token_dialog_copy_and_expiry_clears_token(self):
+        manager = UnifiedComputeManager(self.db, credential_store=FakeCredentialStore())
+        token, expires = manager.create_enrollment_token(lifetime_minutes=1)
+        dialog = _EnrollmentTokenDialog(manager, token, expires)
+        dialog.copy_token()
+        self.assertEqual(QApplication.clipboard().text(), token)
+        dialog.expires_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        dialog.update_status()
+        self.assertEqual(dialog.token, "")
+        self.assertEqual(dialog.token_edit.text(), "")
+        dialog.timer.stop(); dialog.close(); manager.close()
+
+    def test_compute_center_layout_remains_visible_at_common_window_sizes(self):
+        manager = UnifiedComputeManager(self.db, credential_store=FakeCredentialStore())
+        panel = ComputeCenterPanel(manager)
+        for width, height in ((960, 640), (1280, 800), (1650, 950)):
+            panel.resize(width, height); panel.show(); panel.tabs.setCurrentIndex(2)
+            self.app.processEvents()
+            self.assertGreater(panel.tabs.width(), 0)
+            self.assertGreater(panel.tabs.height(), 0)
+            self.assertGreater(panel.jobs_table.width(), 0)
+            self.assertGreater(panel.jobs_table.height(), 0)
+        panel.stop(); manager.close(); panel.close(); self.app.processEvents()
+
     def test_scheduler_runs_concurrent_cpu_jobs_and_releases_resources(self):
         started = [threading.Event(), threading.Event()]; release = threading.Event()
         counts = {"active": 0, "max": 0, "lock": threading.Lock()}; workers = []
@@ -231,10 +308,36 @@ class ComputeManagerTests(unittest.TestCase):
         panel = ComputeCenterPanel(manager)
         self.assertEqual(panel.mode.currentText(), "Controller")
         self.assertGreaterEqual(panel.tabs.count(), 4)
+        self.assertIn("Controller listener:", panel.resource_summary.text())
+        self.assertNotIn("Remote execution disabled", panel.resource_summary.text())
+        self.assertTrue(any(button.text() == "Archive selected" for button in panel.findChildren(QPushButton)))
+        self.assertTrue(any(button.text() == "Remove revoked worker…" for button in panel.findChildren(QPushButton)))
         panel.stop(); manager.close(); panel.close()
         if os.name != "nt":
             with self.assertRaisesRegex(RuntimeError, "DPAPI"):
                 DPAPICredentialStore(self.root / "credentials").save("node", "secret")
+
+    def test_guided_remote_training_resolves_main_window_through_stacked_widget(self):
+        manager = UnifiedComputeManager(self.db, credential_store=FakeCredentialStore())
+
+        class MainWindow(QWidget):
+            def __init__(self):
+                super().__init__()
+                self.manager = type("DatasetOwner", (), {"info": object()})()
+                self._training_config = lambda: object()
+                layout = QVBoxLayout(self)
+                self.stack = QStackedWidget(self)
+                layout.addWidget(self.stack)
+
+        main_window = MainWindow()
+        panel = ComputeCenterPanel(manager, main_window.stack)
+        main_window.stack.addWidget(panel)
+
+        self.assertIs(panel.parentWidget(), main_window.stack)
+        self.assertFalse(hasattr(panel.parentWidget(), "manager"))
+        self.assertIs(panel._resolve_training_owner(), main_window)
+
+        panel.stop(); manager.close(); panel.close(); main_window.close(); self.app.processEvents()
 
     def test_mocked_tls_worker_connection_performs_enrollment_and_heartbeats(self):
         controller_to_worker = queue.Queue(); worker_to_controller = queue.Queue()

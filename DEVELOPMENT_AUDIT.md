@@ -2,6 +2,39 @@
 
 Audit date: 2026-11-01
 
+## Phase 6.1 — Distributed compute reliability, security and UX
+
+Audit update: 2026-11-03. The Phase 6.1 reliability/security slice is implemented; physical acceptance remains pending.
+
+### Implemented
+
+- Built-in controller CA and TLS certificate setup/reuse/renewal/CA rotation with SAN discovery, certificate/key validation, and Windows DPAPI protected private keys. Workers can import a constrained enrollment package containing only controller endpoint, public CA, one-use token, and expiry.
+- Enrollment dialog controls for copy/show, expiration countdown, consumption state, token rotation/revocation, and expiry cleanup. Enrollment tokens remain hashed in SQLite. Added auditable security events with redaction for enrollment/authentication, approval/revocation, assignment/cancel, transfer, and artifact operations.
+- TLS listener defaults to loopback, uses TLS 1.2 minimum, peer attempt/client caps, bounded handshakes, duplicate session prevention, approved-worker command gating, and outbound worker reconnect with bounded exponential backoff and jitter. Existing hostname and trust validation is retained.
+- Explicit dataset/archive and artifact size caps, free-space preflight, existing path traversal protections, content hash verification, and cache reuse remain in the transfer path.
+- Shared worker suitability diagnostics now evaluate fresh heartbeat memory, request, reservations, configured safety, GPU memory, disk, and runtime capability. Connection, approval, execution capability, and scheduling eligibility appear separately in the Compute Center.
+- Job history supports archive/delete/clear terminal actions and log inspection. Active jobs and remote jobs lacking worker-confirmed terminal state are protected; deleting queue metadata preserves experiment records and artifact files.
+- Worker Manager provides **Remove revoked worker…**. Removal is a soft hide requiring revocation, disconnection, and no active jobs. It preserves the worker row and heartbeat/job/security history while excluding the registration from the normal worker list.
+- Updated two-computer quick start, Phase 6 operating guide, user manual, project guide, README, and this audit for actual setup and limitations.
+
+### Database migration
+
+- Schema version 5 migrates existing version 3/4 databases in place, adding token revocation state, job archive state, the security event table/index, and revoked-worker removal state. Existing jobs, experiments, artifacts, worker rows, and files are preserved.
+
+### Verification (current workspace)
+
+- Full regression suite: **103 tests passed, 0 failed, in 182.828 seconds**. This includes UI/layout smoke coverage, Guided Remote Training parent resolution, mocked TLS/enrollment, certificate and package validation, job-history protections, scheduler/reservation checks, dataset transfer integrity, existing Phase 1–5 regression, and actual isolated CPU YOLO/RT-DETR smoke training.
+- Python compilation: all 9 changed Python files compiled successfully.
+- `git diff --check`: no whitespace errors; Git emitted only LF-to-CRLF working-copy notices.
+- Physical two-computer network test: **not performed**. Remote GPU test: **not performed** (this environment has CPU-only PyTorch). Actual monitor scaling at Windows 100%, 125%, and 150%: **not performed**; automated UI checks cover common window dimensions only.
+
+### Remaining limitations
+
+- Worker process reconciliation after a full worker restart and automatic resume remain user-directed; no automatic duplicate training retry is introduced. Long network interruptions still require inspection of worker-local status/checkpoints before resubmission.
+- DPAPI protected keys/credentials require Windows. TLS real-socket certificate rejection is covered by automated local tests; multi-machine routing/firewall behavior still needs manual verification.
+- The 128 GiB dataset archive and 64 GiB artifact transfer limits are fixed safety ceilings. GPU utilization telemetry depends on available platform tools. Framework/CUDA exact-version compatibility is reported but not fully enforced.
+- The physical checklist remains: two machines, Private-network-only firewall rule, certificate SAN check against the selected controller address, enrollment/approval, worker hardware report, small CPU YOLO training with hash-verified dataset/checkpoints and experiment update, restart persistence, then optional RT-DETR/GPU run.
+
 ## Environment
 
 - OS: Windows 11 (10.0.26300), x64.
